@@ -323,6 +323,7 @@
         const Eye = (p) => <IconWrapper name="Eye" {...p} />;
         const Scissors = (p) => <IconWrapper name="Scissors" {...p} />;
         const Layout = (p) => <IconWrapper name="Layout" {...p} />;
+        const Hand = (p) => <IconWrapper name="Hand" {...p} />;
         const Download = (p) => <IconWrapper name="Download" {...p} />;
         const Save = (p) => <IconWrapper name="Save" {...p} />;
         const FolderOpen = (p) => <IconWrapper name="FolderOpen" {...p} />;
@@ -1355,6 +1356,190 @@ You must design a visual composition that tells the story through **8 distinct p
             );
         };
 
+        // ★ Minimap 缩略图导航组件
+        const Minimap = ({ nodes, view, onViewportChange, theme, selectedNodeIds, width = 200, height = 150 }) => {
+            const minimapRef = useRef(null);
+            const [isDraggingViewport, setIsDraggingViewport] = useState(false);
+
+            // 计算所有节点的包围盒
+            const bounds = useMemo(() => {
+                if (nodes.length === 0) {
+                    return { minX: 0, minY: 0, maxX: VIRTUAL_CANVAS_WIDTH, maxY: VIRTUAL_CANVAS_HEIGHT };
+                }
+                let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+                nodes.forEach(n => {
+                    minX = Math.min(minX, n.x);
+                    minY = Math.min(minY, n.y);
+                    maxX = Math.max(maxX, n.x + n.width);
+                    maxY = Math.max(maxY, n.y + n.height);
+                });
+                // 加 padding
+                const padding = 100;
+                return {
+                    minX: minX - padding,
+                    minY: minY - padding,
+                    maxX: maxX + padding,
+                    maxY: maxY + padding
+                };
+            }, [nodes]);
+
+            // 计算缩略图缩放比例
+            const scale = useMemo(() => {
+                const bw = bounds.maxX - bounds.minX;
+                const bh = bounds.maxY - bounds.minY;
+                if (bw <= 0 || bh <= 0) return 1;
+                return Math.min(width / bw, height / bh);
+            }, [bounds, width, height]);
+
+            // 节点颜色映射
+            const getNodeColor = (type) => {
+                const colors = {
+                    'generate-image': '#3b82f6',
+                    'image-to-image': '#8b5cf6',
+                    'video-input': '#f59e0b',
+                    'video-animate': '#10b981',
+                    'video-analyze': '#ef4444',
+                    'text-prompt': '#6366f1',
+                    'input-image': '#ec4899',
+                    'preview': '#14b8a6',
+                    'upscale': '#f97316',
+                    'batch': '#06b6d4',
+                };
+                return colors[type] || (theme === 'dark' ? '#71717a' : '#a1a1aa');
+            };
+
+            // 世界坐标 → 缩略图坐标
+            const worldToMinimap = (wx, wy) => ({
+                x: (wx - bounds.minX) * scale,
+                y: (wy - bounds.minY) * scale
+            });
+
+            // 缩略图坐标 → 世界坐标
+            const minimapToWorld = (mx, my) => ({
+                x: mx / scale + bounds.minX,
+                y: my / scale + bounds.minY
+            });
+
+            // 视口矩形（在缩略图上的位置和大小）
+            const viewportRect = useMemo(() => {
+                const canvasEl = document.getElementById('canvas-bg');
+                const canvasW = canvasEl?.clientWidth || window.innerWidth - 56; // 减去 sidebar 宽度
+                const canvasH = canvasEl?.clientHeight || window.innerHeight - 48; // 减去 topbar 高度
+                const tl = worldToMinimap(-view.x / view.zoom, -view.y / view.zoom);
+                const br = worldToMinimap((canvasW - view.x) / view.zoom, (canvasH - view.y) / view.zoom);
+                return {
+                    x: tl.x,
+                    y: tl.y,
+                    w: br.x - tl.x,
+                    h: br.y - tl.y
+                };
+            }, [view, scale, bounds]);
+
+            const handleMinimapMouseDown = (e) => {
+                e.stopPropagation();
+                const rect = minimapRef.current.getBoundingClientRect();
+                const mx = e.clientX - rect.left;
+                const my = e.clientY - rect.top;
+                const world = minimapToWorld(mx, my);
+                const canvasEl = document.getElementById('canvas-bg');
+                const canvasW = canvasEl?.clientWidth || window.innerWidth - 56;
+                const canvasH = canvasEl?.clientHeight || window.innerHeight - 48;
+                // 让点击位置成为画布中心
+                onViewportChange({
+                    x: canvasW / 2 - world.x * view.zoom,
+                    y: canvasH / 2 - world.y * view.zoom,
+                    zoom: view.zoom
+                });
+                setIsDraggingViewport(true);
+            };
+
+            const handleMinimapMouseMove = (e) => {
+                if (!isDraggingViewport) return;
+                const rect = minimapRef.current.getBoundingClientRect();
+                const mx = e.clientX - rect.left;
+                const my = e.clientY - rect.top;
+                const world = minimapToWorld(mx, my);
+                const canvasEl = document.getElementById('canvas-bg');
+                const canvasW = canvasEl?.clientWidth || window.innerWidth - 56;
+                const canvasH = canvasEl?.clientHeight || window.innerHeight - 48;
+                onViewportChange({
+                    x: canvasW / 2 - world.x * view.zoom,
+                    y: canvasH / 2 - world.y * view.zoom,
+                    zoom: view.zoom
+                });
+            };
+
+            const handleMinimapMouseUp = () => {
+                setIsDraggingViewport(false);
+            };
+
+            useEffect(() => {
+                if (!isDraggingViewport) return;
+                window.addEventListener('mousemove', handleMinimapMouseMove);
+                window.addEventListener('mouseup', handleMinimapMouseUp);
+                return () => {
+                    window.removeEventListener('mousemove', handleMinimapMouseMove);
+                    window.removeEventListener('mouseup', handleMinimapMouseUp);
+                };
+            }, [isDraggingViewport, scale, bounds, view.zoom]);
+
+            return (
+                <div
+                    ref={minimapRef}
+                    className="fixed bottom-4 right-4 rounded-lg border shadow-lg overflow-hidden select-none"
+                    style={{
+                        width,
+                        height,
+                        background: theme === 'dark' ? 'rgba(24,24,27,0.85)' : 'rgba(255,255,255,0.85)',
+                        borderColor: theme === 'dark' ? '#3f3f46' : '#e4e4e7',
+                        backdropFilter: 'blur(8px)',
+                        zIndex: 45
+                    }}
+                    onMouseDown={handleMinimapMouseDown}
+                >
+                    {/* 节点小方块 */}
+                    {nodes.map(node => {
+                        const pos = worldToMinimap(node.x, node.y);
+                        const isSelected = selectedNodeIds.has(node.id);
+                        return (
+                            <div
+                                key={node.id}
+                                className="absolute rounded-[1px]"
+                                style={{
+                                    left: pos.x,
+                                    top: pos.y,
+                                    width: Math.max(2, node.width * scale),
+                                    height: Math.max(2, node.height * scale),
+                                    backgroundColor: getNodeColor(node.type),
+                                    opacity: isSelected ? 1 : 0.6,
+                                    boxShadow: isSelected ? `0 0 3px ${getNodeColor(node.type)}` : 'none'
+                                }}
+                            />
+                        );
+                    })}
+                    {/* 视口矩形 */}
+                    <div
+                        className="absolute border-2 pointer-events-none"
+                        style={{
+                            left: viewportRect.x,
+                            top: viewportRect.y,
+                            width: Math.max(4, viewportRect.w),
+                            height: Math.max(4, viewportRect.h),
+                            borderColor: theme === 'dark' ? '#60a5fa' : '#2563eb',
+                            backgroundColor: theme === 'dark' ? 'rgba(96,165,250,0.08)' : 'rgba(37,99,235,0.06)'
+                        }}
+                    />
+                    {/* 标题 */}
+                    <div
+                        className="absolute top-1 left-2 text-[10px] font-medium pointer-events-none"
+                        style={{ color: theme === 'dark' ? '#a1a1aa' : '#71717a' }}
+                    >
+                        缩略图
+                    </div>
+                </div>
+            );
+        };
+
         function TapnowApp() {
             const [theme, setTheme] = useState(() => {
                 try {
@@ -1995,6 +2180,12 @@ You must design a visual composition that tells the story through **8 distinct p
             }, [promptLibrary]);
 
             // State management
+            const [cursorMode, setCursorMode] = useState('select'); // 'select' | 'hand'
+            const cursorModeRef = useRef('select');
+            useEffect(() => { cursorModeRef.current = cursorMode; }, [cursorMode]);
+            const [spaceHeld, setSpaceHeld] = useState(false); // Space键临时抓手
+            const spaceHeldRef = useRef(false);
+            useEffect(() => { spaceHeldRef.current = spaceHeld; }, [spaceHeld]);
             const [isPanning, setIsPanning] = useState(false);
             const [isDragging, setIsDragging] = useState(false);
             const [dragNodeId, setDragNodeId] = useState(null);
@@ -2011,6 +2202,7 @@ You must design a visual composition that tells the story through **8 distinct p
             const [selectionBox, setSelectionBox] = useState(null); // { startX, startY, endX, endY } (屏幕坐标)
             const [selectedNodeIds, setSelectedNodeIds] = useState(new Set()); // 多选节点ID集合
             const isSelectingRef = useRef(false); // 使用ref跟踪框选状态，确保即使Ctrl松开也能继续框选
+            const [showSelectionToolbar, setShowSelectionToolbar] = useState(false); // 框选后浮动工具条
 
             const [contextMenu, setContextMenu] = useState({ x: 0, y: 0, worldX: 0, worldY: 0, visible: false });
             const [historyContextMenu, setHistoryContextMenu] = useState({ visible: false, x: 0, y: 0, worldX: 0, worldY: 0, item: null });
@@ -2131,6 +2323,43 @@ You must design a visual composition that tells the story through **8 distinct p
                     window.removeEventListener('keydown', handleDeleteKey);
                 };
             }, []);
+
+            // 框选浮动工具条：当选中节点 < 2 时自动隐藏
+            useEffect(() => {
+                if (selectedNodeIds.size < 2) {
+                    setShowSelectionToolbar(false);
+                }
+            }, [selectedNodeIds]);
+
+            // Space 键临时抓手模式
+            useEffect(() => {
+                const handleSpaceDown = (e) => {
+                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
+                    if (e.key === ' ' && !e.repeat) {
+                        e.preventDefault();
+                        setSpaceHeld(true);
+                        spaceHeldRef.current = true;
+                    }
+                };
+                const handleSpaceUp = (e) => {
+                    if (e.key === ' ') {
+                        setSpaceHeld(false);
+                        spaceHeldRef.current = false;
+                        // 如果正在平移，结束平移
+                        if (isPanning) {
+                            setIsPanning(false);
+                            setIsDragging(false);
+                        }
+                    }
+                };
+                window.addEventListener('keydown', handleSpaceDown);
+                window.addEventListener('keyup', handleSpaceUp);
+                return () => {
+                    window.removeEventListener('keydown', handleSpaceDown);
+                    window.removeEventListener('keyup', handleSpaceUp);
+                };
+            }, [isPanning]);
+
             // 保存角色库到 localStorage（使用防抖优化）
             const debouncedSaveCharacters = useMemo(() => debounce((charactersToSave) => {
                 try {
@@ -2832,7 +3061,7 @@ You must design a visual composition that tells the story through **8 distinct p
                         if (selection && selection.toString().length > 0) {
                             return; // 如果有文本选择，不处理拖动
                         }
-                        
+
                         // 检查是否点击在可交互元素上（input, textarea, select, button等）
                         const target = e.target;
                         if (target && (
@@ -2845,7 +3074,17 @@ You must design a visual composition that tells the story through **8 distinct p
                         )) {
                             return; // 如果点击在可交互元素上，不处理拖动
                         }
-                        
+
+                        // 抓手模式或 Space 键临时抓手：左键直接平移
+                        const isHandMode = cursorMode === 'hand' || spaceHeldRef.current;
+                        if (e.button === 0 && isHandMode) {
+                            e.preventDefault();
+                            setIsPanning(true);
+                            setIsDragging(false);
+                            lastMousePos.current = { x: e.clientX, y: e.clientY };
+                            return;
+                        }
+
                         // 检测Ctrl+鼠标左键，开始框选
                         if (e.button === 0 && (e.ctrlKey || e.metaKey)) {
                             e.preventDefault();
@@ -3071,8 +3310,13 @@ You must design a visual composition that tells the story through **8 distinct p
                     if (selectedNodeIds.size === 1) {
                         const nodeId = Array.from(selectedNodeIds)[0];
                         setSelectedNodeId(nodeId);
+                        setShowSelectionToolbar(false);
                     } else if (selectedNodeIds.size === 0) {
                         setSelectedNodeId(null);
+                        setShowSelectionToolbar(false);
+                    } else {
+                        // 多选节点 >= 2，显示浮动整理按钮
+                        setShowSelectionToolbar(true);
                     }
                     // 确保清理拖动状态
                     setIsDragging(false);
@@ -14544,6 +14788,22 @@ You must design a visual composition that tells the story through **8 distinct p
                             >
                                 <Layout size={18} />
                             </button>
+                            {/* 抓手模式切换 */}
+                            <button
+                                onClick={() => setCursorMode(prev => prev === 'hand' ? 'select' : 'hand')}
+                                className={`p-2.5 rounded-lg transition-all mb-2 ${
+                                    cursorMode === 'hand'
+                                        ? theme === 'dark'
+                                            ? 'bg-blue-600/20 text-blue-400'
+                                            : 'bg-blue-100 text-blue-600'
+                                        : theme === 'dark'
+                                            ? 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800'
+                                            : 'text-zinc-500 hover:text-zinc-800 hover:bg-zinc-200'
+                                }`}
+                                title={`抓手模式 (Space 键临时切换) — ${cursorMode === 'hand' ? '已开启' : '已关闭'}`}
+                            >
+                                <Hand size={18} />
+                            </button>
                             {[ { id: 'select', icon: MousePointer2 }, { id: 'history', icon: History } ].map((tool) => (
                                 <button
                                     key={tool.id}
@@ -14885,7 +15145,7 @@ You must design a visual composition that tells the story through **8 distinct p
 
                         {/* Main Canvas Area */}
                         <div className="flex-1 relative overflow-hidden flex">
-                             <div ref={canvasRef} id="canvas-bg" className="flex-1 h-full cursor-default relative"
+                             <div ref={canvasRef} id="canvas-bg" className="flex-1 h-full relative" style={{ cursor: (cursorMode === 'hand' || spaceHeld) ? (isPanning ? 'grabbing' : 'grab') : (isPanning ? 'grabbing' : 'default') }}
                                 onMouseDown={handleMouseDown} onClick={handleBackgroundClick} onDoubleClick={handleDoubleClick}
                                 style={{ 
                                     backgroundImage: theme === 'dark' 
@@ -14963,7 +15223,74 @@ You must design a visual composition that tells the story through **8 distinct p
                                         }}
                                     />
                                 )}
+
+                                {/* 框选后浮动整理工具条 */}
+                                {showSelectionToolbar && selectedNodeIds.size >= 2 && (
+                                    <div
+                                        className="absolute z-[60] flex items-center gap-2 px-3 py-2 rounded-xl shadow-xl border backdrop-blur-sm transition-all duration-200"
+                                        style={{
+                                            left: '50%',
+                                            bottom: '1.5rem',
+                                            transform: 'translateX(-50%)',
+                                            background: theme === 'dark' ? 'rgba(24,24,27,0.92)' : 'rgba(255,255,255,0.92)',
+                                            borderColor: theme === 'dark' ? '#3f3f46' : '#e4e4e7',
+                                        }}
+                                    >
+                                        <span className={`text-xs font-medium ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-600'}`}>
+                                            已选 {selectedNodeIds.size} 个节点
+                                        </span>
+                                        <div className={`w-px h-4 ${theme === 'dark' ? 'bg-zinc-700' : 'bg-zinc-300'}`} />
+                                        <button
+                                            onClick={() => { autoArrangeNodes(); setShowSelectionToolbar(false); }}
+                                            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-colors ${
+                                                theme === 'dark'
+                                                    ? 'bg-blue-600/20 text-blue-400 hover:bg-blue-600/30'
+                                                    : 'bg-blue-50 text-blue-600 hover:bg-blue-100'
+                                            }`}
+                                            title="自动整理选中的节点"
+                                        >
+                                            <Layout size={14} />
+                                            自动整理
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                selectedNodeIds.forEach(id => deleteNode(id));
+                                                setSelectedNodeIds(new Set());
+                                                setShowSelectionToolbar(false);
+                                            }}
+                                            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-colors ${
+                                                theme === 'dark'
+                                                    ? 'bg-red-500/10 text-red-400 hover:bg-red-500/20'
+                                                    : 'bg-red-50 text-red-600 hover:bg-red-100'
+                                            }`}
+                                            title="删除选中的节点"
+                                        >
+                                            <Trash2 size={14} />
+                                            删除
+                                        </button>
+                                        <button
+                                            onClick={() => setShowSelectionToolbar(false)}
+                                            className={`p-1 rounded-lg transition-colors ${
+                                                theme === 'dark'
+                                                    ? 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800'
+                                                    : 'text-zinc-400 hover:text-zinc-700 hover:bg-zinc-200'
+                                            }`}
+                                            title="关闭"
+                                        >
+                                            <X size={14} />
+                                        </button>
+                                    </div>
+                                )}
                             </div>
+
+                            {/* ★ Minimap 缩略图导航 */}
+                            <Minimap
+                                nodes={nodes}
+                                view={view}
+                                onViewportChange={(newView) => setView(newView)}
+                                theme={theme}
+                                selectedNodeIds={selectedNodeIds}
+                            />
 
                             {/* Chat Sidebar Panel */}
                             <div
