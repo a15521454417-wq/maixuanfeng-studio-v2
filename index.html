@@ -1712,6 +1712,7 @@ You must design a visual composition that tells the story through **8 distinct p
             'input-image': '📷 图片输入', 'video-input': '📹 视频输入',
             'preview': '👁️ 预览', 'storyboard-node': '📋 分镜',
             'text-input': '📝 文本', 'video-analyze': '🔍 视频分析', 'note': '📌 备注',
+            'group-frame': '📦 分组框',
         };
 
         // 初始化 Konva Stage
@@ -1802,35 +1803,39 @@ You must design a visual composition that tells the story through **8 distinct p
                     });
 
                     // 背景矩形
+                    const isGroupFrame = node.type === 'group-frame';
                     const bgRect = new Konva.Rect({
                         x: 0,
                         y: 0,
                         width: node.width,
                         height: node.height,
-                        fill: '#18181b',
-                        stroke: isSelected ? KONVA_CFG.selStroke : KONVA_CFG.normStroke,
+                        fill: isGroupFrame ? 'rgba(59, 130, 246, 0.06)' : '#18181b',
+                        stroke: isSelected ? KONVA_CFG.selStroke : (isGroupFrame ? '#3b82f6' : KONVA_CFG.normStroke),
                         strokeWidth: isSelected ? 3 : KONVA_CFG.strokeW,
-                        cornerRadius: KONVA_CFG.r,
-                        shadowColor: KONVA_CFG.shadowColor,
-                        shadowBlur: KONVA_CFG.shadowBlur,
-                        shadowOffsetY: KONVA_CFG.shadowOffY,
+                        cornerRadius: isGroupFrame ? 4 : KONVA_CFG.r,
+                        dash: isGroupFrame ? [8, 4] : undefined,
+                        shadowColor: isGroupFrame ? 'transparent' : KONVA_CFG.shadowColor,
+                        shadowBlur: isGroupFrame ? 0 : KONVA_CFG.shadowBlur,
+                        shadowOffsetY: isGroupFrame ? 0 : KONVA_CFG.shadowOffY,
                     });
                     group.add(bgRect);
 
-                    // 标题栏
-                    const titleText = new Konva.Text({
-                        x: KONVA_CFG.pad + 20,
-                        y: KONVA_CFG.pad,
-                        text: label,
-                        fontSize: KONVA_CFG.fontSize,
-                        fill: KONVA_CFG.fontColor,
-                        fontFamily: 'system-ui, sans-serif',
-                        fontStyle: '600',
-                    });
-                    group.add(titleText);
+                    if (!isGroupFrame) {
+                        // 标题栏
+                        const titleText = new Konva.Text({
+                            x: KONVA_CFG.pad + 20,
+                            y: KONVA_CFG.pad,
+                            text: label,
+                            fontSize: KONVA_CFG.fontSize,
+                            fill: KONVA_CFG.fontColor,
+                            fontFamily: 'system-ui, sans-serif',
+                            fontStyle: '600',
+                        });
+                        group.add(titleText);
+                    }
 
                     // 输入连接点（左侧）
-                    if (node.type !== 'preview') {
+                    if (node.type !== 'preview' && !isGroupFrame) {
                         const inputPort = new Konva.Circle({
                             x: 0,
                             y: node.height / 2,
@@ -1843,7 +1848,7 @@ You must design a visual composition that tells the story through **8 distinct p
                     }
 
                     // 输出连接点（右侧）
-                    if (node.type !== 'input-image' && node.type !== 'video-input' && node.type !== 'video-analyze' && node.type !== 'preview') {
+                    if (node.type !== 'input-image' && node.type !== 'video-input' && node.type !== 'video-analyze' && node.type !== 'preview' && !isGroupFrame) {
                         const outputPort = new Konva.Circle({
                             x: node.width,
                             y: node.height / 2,
@@ -1866,9 +1871,29 @@ You must design a visual composition that tells the story through **8 distinct p
                     group.on('dragmove', (e) => {
                         e.cancelBubble = true;
                         const pos = group.position();
-                        setNodes(prev => prev.map(n =>
-                            n.id === node.id ? { ...n, x: pos.x, y: pos.y } : n
-                        ));
+                        if (isGroupFrame) {
+                            // group-frame 拖动时，同时移动内部节点
+                            const oldNode = nodesRef.current.find(n => n.id === node.id);
+                            if (oldNode) {
+                                const dx = pos.x - oldNode.x;
+                                const dy = pos.y - oldNode.y;
+                                setNodes(prev => prev.map(n => {
+                                    if (n.id === node.id) return { ...n, x: pos.x, y: pos.y };
+                                    // 移动内部节点：中心点在 frame 内的节点
+                                    const cx = n.x + n.width / 2;
+                                    const cy = n.y + n.height / 2;
+                                    if (cx >= oldNode.x && cx <= oldNode.x + oldNode.width &&
+                                        cy >= oldNode.y && cy <= oldNode.y + oldNode.height) {
+                                        return { ...n, x: n.x + dx, y: n.y + dy };
+                                    }
+                                    return n;
+                                }));
+                            }
+                        } else {
+                            setNodes(prev => prev.map(n =>
+                                n.id === node.id ? { ...n, x: pos.x, y: pos.y } : n
+                            ));
+                        }
                     });
 
                     group.on('dragend', (e) => {
@@ -1883,6 +1908,7 @@ You must design a visual composition that tells the story through **8 distinct p
                     });
 
                     nodeLayerRef.current.add(group);
+                    if (isGroupFrame) group.zIndex(0);
                     nodeMap.set(node.id, group);
                 } else {
                     // 更新现有节点位置和样式
@@ -3265,11 +3291,49 @@ You must design a visual composition that tells the story through **8 distinct p
                 }
 
                 if (resizingNodeId) {
-                    scheduleNodeUpdate(resizingNodeId, (node) => ({
-                        ...node,
-                        width: Math.max(250, worldPos.x - node.x),
-                        height: Math.max(250, worldPos.y - node.y)
-                    }));
+                    const resizingNode = nodesRef.current.find(n => n.id === resizingNodeId);
+                    const isGroupFrameResize = resizingNode?.type === 'group-frame';
+                    const oldW = resizingNode?.width || 500;
+                    const oldH = resizingNode?.height || 400;
+                    const newW = Math.max(250, worldPos.x - (resizingNode?.x || 0));
+                    const newH = Math.max(250, worldPos.y - (resizingNode?.y || 0));
+                    const scaleX = newW / oldW;
+                    const scaleY = newH / oldH;
+
+                    if (isGroupFrameResize) {
+                        // group-frame 调整大小时，内部节点按比例跟随
+                        const updates = [];
+                        nodesRef.current.forEach(n => {
+                            if (n.id === resizingNodeId) {
+                                updates.push({ nodeId: n.id, updater: (node) => ({ ...node, width: newW, height: newH }) });
+                            } else if (n.type !== 'group-frame') {
+                                const cx = n.x + n.width / 2;
+                                const cy = n.y + n.height / 2;
+                                if (cx >= resizingNode.x && cx <= resizingNode.x + oldW &&
+                                    cy >= resizingNode.y && cy <= resizingNode.y + oldH) {
+                                    const relX = (n.x - resizingNode.x) / oldW;
+                                    const relY = (n.y - resizingNode.y) / oldH;
+                                    updates.push({
+                                        nodeId: n.id,
+                                        updater: (node) => ({
+                                            ...node,
+                                            x: resizingNode.x + relX * newW,
+                                            y: resizingNode.y + relY * newH,
+                                            width: Math.max(100, node.width * scaleX),
+                                            height: Math.max(80, node.height * scaleY)
+                                        })
+                                    });
+                                }
+                            }
+                        });
+                        if (updates.length > 0) scheduleMultiNodeUpdate(updates);
+                    } else {
+                        scheduleNodeUpdate(resizingNodeId, (node) => ({
+                            ...node,
+                            width: newW,
+                            height: newH
+                        }));
+                    }
                 } else if (dragNodeId) {
                     // 使用 movementX/Y 更流畅，避免频繁计算
                     const deltaX = e.movementX / view.zoom;
@@ -3278,8 +3342,27 @@ You must design a visual composition that tells the story through **8 distinct p
                     if (Math.abs(deltaX) > 0.1 || Math.abs(deltaY) > 0.1) {
                         // 使用 ref 获取最新的多选节点集合，避免闭包问题
                         const currentSelectedNodeIds = selectedNodeIdsRef.current;
-                        // 如果有多选节点（大于1个）且被拖动的节点在选中集合中，同时拖动所有选中的节点
-                        if (currentSelectedNodeIds && currentSelectedNodeIds.size > 1 && currentSelectedNodeIds.has(dragNodeId)) {
+                        const draggedNode = nodesRef.current.find(n => n.id === dragNodeId);
+                        const isDraggingGroupFrame = draggedNode?.type === 'group-frame';
+
+                        // group-frame 拖动时，同时移动内部节点
+                        if (isDraggingGroupFrame) {
+                            const frame = draggedNode;
+                            const updates = [];
+                            nodesRef.current.forEach(n => {
+                                if (n.id === dragNodeId) {
+                                    updates.push({ nodeId: n.id, updater: (node) => ({ ...node, x: node.x + deltaX, y: node.y + deltaY }) });
+                                } else if (n.type !== 'group-frame') {
+                                    const cx = n.x + n.width / 2;
+                                    const cy = n.y + n.height / 2;
+                                    if (cx >= frame.x && cx <= frame.x + frame.width &&
+                                        cy >= frame.y && cy <= frame.y + frame.height) {
+                                        updates.push({ nodeId: n.id, updater: (node) => ({ ...node, x: node.x + deltaX, y: node.y + deltaY }) });
+                                    }
+                                }
+                            });
+                            if (updates.length > 0) scheduleMultiNodeUpdate(updates);
+                        } else if (currentSelectedNodeIds && currentSelectedNodeIds.size > 1 && currentSelectedNodeIds.has(dragNodeId)) {
                             // 拖动多个节点时，使用批量更新
                             const updates = Array.from(currentSelectedNodeIds).map(nodeId => ({
                                 nodeId,
@@ -8767,7 +8850,9 @@ You must design a visual composition that tells the story through **8 distinct p
                                             ? { w: 360, h: 400 }
                                             : type === 'batch-generator'
                                                 ? { w: 400, h: 500 }
-                                                : { w: 260, h: 260 };
+                                                : type === 'group-frame'
+                                                    ? { w: 500, h: 400 }
+                                                    : { w: 260, h: 260 };
                 const newNode = {
                     id: `node-${Date.now()}`,
                     type,
@@ -8795,6 +8880,8 @@ You must design a visual composition that tells the story through **8 distinct p
                                     ? { model: 'gemini-3-pro', inputPrompt: '', optimizedPrompt: '', isOptimizing: false }
                                 : type === 'batch-generator'
                                     ? { model: 'nano-banana', basePrompt: '', params: { ratio: ['1:1', '16:9'], style: ['写实', '二次元'] }, tasks: [], isGenerating: false }
+                                : type === 'group-frame'
+                                    ? { name: '未命名组' }
                                     : {},
                 };
                 setNodes(prev => [...prev, newNode]);
@@ -11454,8 +11541,8 @@ You must design a visual composition that tells the story through **8 distinct p
                             top: node.y, 
                             width: node.width, 
                             height: node.height, 
-                            cursor: (dragNodeId === node.id || (dragNodeId && selectedNodeIds.has(node.id))) ? 'grabbing' : 'default', 
-                            zIndex: 10,
+                            cursor: (dragNodeId === node.id || (dragNodeId && selectedNodeIds.has(node.id))) ? 'grabbing' : (node.type === 'group-frame' ? 'grab' : 'default'), 
+                            zIndex: node.type === 'group-frame' ? 5 : 10,
                             WebkitFontSmoothing: 'antialiased',
                             MozOsxFontSmoothing: 'grayscale',
                             textRendering: 'optimizeLegibility',
@@ -11523,7 +11610,7 @@ You must design a visual composition that tells the story through **8 distinct p
                         </button>
                         <div className="absolute bottom-1 right-1 w-4 h-4 z-[100] resize-handle flex items-end justify-end p-0.5" onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); setResizingNodeId(node.id); }}><svg width="6" height="6" viewBox="0 0 8 8" fill="none" className="text-zinc-600"><path d="M8 0L8 8L0 8" stroke="currentColor" strokeWidth="2" /></svg></div>
                         
-                        {node.type !== 'input-image' && node.type !== 'video-input' && node.type !== 'video-analyze' && node.type !== 'preview' && (
+                        {node.type !== 'group-frame' && node.type !== 'input-image' && node.type !== 'video-input' && node.type !== 'video-analyze' && node.type !== 'preview' && (
                             node.type === 'image-compare' ? (
                                 <>
                                     <div 
@@ -11575,7 +11662,7 @@ You must design a visual composition that tells the story through **8 distinct p
                             )
                         )}
                         
-                        {node.type !== 'preview' && (
+                        {node.type !== 'preview' && node.type !== 'group-frame' && (
                             <div
                                 className={`connector connector-right ${connectingSource === node.id ? 'active' : ''} ${connectingTarget && hoverTargetId === node.id ? 'ring-2 ring-green-500/50' : ''}`}
                                 title="输出"
@@ -11595,13 +11682,31 @@ You must design a visual composition that tells the story through **8 distinct p
                         )}
                         
 
+                        {node.type === 'group-frame' && (
+                            <div className="flex-1 flex flex-col h-full w-full relative pointer-events-auto">
+                                {/* 组名输入 */}
+                                <div className={`flex items-center px-3 py-1.5 border-b ${theme === 'dark' ? 'border-blue-500/30 bg-blue-500/10' : 'border-blue-400/30 bg-blue-50'} rounded-t-xl`}>
+                                    <input
+                                        type="text"
+                                        value={node.settings?.name || '未命名组'}
+                                        onChange={(e) => updateNodeSettings(node.id, { name: e.target.value })}
+                                        onMouseDown={(e) => e.stopPropagation()}
+                                        className={`flex-1 bg-transparent text-xs font-medium outline-none ${theme === 'dark' ? 'text-blue-300 placeholder-blue-500/50' : 'text-blue-700 placeholder-blue-400'}`}
+                                        placeholder="输入组名"
+                                    />
+                                </div>
+                                {/* 半透明背景层 */}
+                                <div className={`flex-1 rounded-b-xl ${theme === 'dark' ? 'bg-blue-500/[0.03]' : 'bg-blue-50/30'}`} />
+                            </div>
+                        )}
+
                         {/* 节点内容区域 - 拖动/缩放时隐藏以提升性能 */}
                         <div
                             className={`overflow-hidden rounded-xl flex-1 flex flex-col pointer-events-none h-full w-full relative transition-opacity duration-150 ${
                                 isInteracting ? 'opacity-0 pointer-events-none absolute' : 'opacity-100'
                             } ${
                                 theme === 'dark' ? 'bg-[#18181b]' : 'bg-white'
-                            }`}
+                            } ${node.type === 'group-frame' ? 'hidden' : ''}`}
                         >
                             {node.type === 'input-image' && (
                                 <div
@@ -14804,6 +14909,21 @@ You must design a visual composition that tells the story through **8 distinct p
                             >
                                 <Hand size={18} />
                             </button>
+                            {/* 分组框 */}
+                            <button
+                                onClick={() => {
+                                    const world = screenToWorld(window.innerWidth / 2, window.innerHeight / 2);
+                                    addNode('group-frame', world.x, world.y);
+                                }}
+                                className={`p-2.5 rounded-lg transition-all mb-2 ${
+                                    theme === 'dark'
+                                        ? 'text-zinc-500 hover:text-blue-400 hover:bg-blue-500/10'
+                                        : 'text-zinc-500 hover:text-blue-600 hover:bg-blue-50'
+                                }`}
+                                title="新建分组框"
+                            >
+                                <LayoutGrid size={18} />
+                            </button>
                             {[ { id: 'select', icon: MousePointer2 }, { id: 'history', icon: History } ].map((tool) => (
                                 <button
                                     key={tool.id}
@@ -15766,6 +15886,7 @@ You must design a visual composition that tells the story through **8 distinct p
                                             { type: 'batch-generator', label: '批量出图 Agent' },
                                             { type: 'expand-node', label: '🖼️ 扩图' },
                                             { type: 'panorama-node', label: '🌅 21:9 全景' },
+                                            { type: 'group-frame', label: '📦 分组框' },
                                         ].map(item => (
                                             <button
                                                 key={item.type}
