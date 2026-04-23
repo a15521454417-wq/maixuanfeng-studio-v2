@@ -7699,8 +7699,11 @@ You must design a visual composition that tells the story through **8 distinct p
                         try {
                             data = JSON.parse(text);
                         } catch (e) {
+                            console.error(`[${logModelName}] 响应非JSON:`, text.substring(0, 200));
                             throw new Error(`响应解析失败: ${text.substring(0, 100)}`);
                         }
+                        
+                        console.log(`[${logModelName}] 响应状态: ${resp.status}, 数据:`, JSON.stringify(data).substring(0, 500));
                         
                         // 检查HTTP状态码错误
                         if (!resp.ok) {
