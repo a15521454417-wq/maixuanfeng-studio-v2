@@ -2028,6 +2028,23 @@ You must design a visual composition that tells the story through **8 distinct p
                 const saved = localStorage.getItem('tapnow_api_configs');
                 let configs = saved ? JSON.parse(saved) : DEFAULT_API_CONFIGS;
                 
+                // 迁移：更新 gpt-image 配置（旧 GPT-4o Image -> 新 gpt-image-2）
+                const gptImageIndex = configs.findIndex(c => c.id === 'gpt-image');
+                if (gptImageIndex >= 0) {
+                    const gptImageConfig = configs[gptImageIndex];
+                    if (gptImageConfig.provider === 'GPT-4o Image' || 
+                        gptImageConfig.provider === 'GPT-4o-image' ||
+                        gptImageConfig.provider.includes('4o') ||
+                        gptImageConfig.modelName === 'gpt-4o-image') {
+                        configs[gptImageIndex] = {
+                            ...gptImageConfig,
+                            provider: 'gpt-image-2',
+                            modelName: 'gpt-image-2'
+                        };
+                        console.log('[Data Migration] Updated gpt-image config to gpt-image-2');
+                    }
+                }
+                
                 // 确保 gpt-5.2 存在（如果不存在则添加）
                 const hasGpt52 = configs.some(c => c.id === 'gpt-5-2');
                 if (!hasGpt52) {
