@@ -963,10 +963,10 @@ You must design a visual composition that tells the story through **8 distinct p
             { value: '2160x3840', label: '4K 竖屏' },
         ];
 
-        const getResolutionsForModel = (modelId) => {
+        const getResolutionsForModel = (modelId, modelName = '') => {
             if (!modelId) return RESOLUTIONS;
-            // gpt-image-2 使用精确尺寸列表
-            if (modelId.includes('gpt-image-2')) return GPT_IMAGE2_SIZES.map(s => s.value);
+            // gpt-image-2 使用精确尺寸列表（检查 id 或 modelName）
+            if (modelId.includes('gpt-image-2') || modelName.includes('gpt-image-2')) return GPT_IMAGE2_SIZES.map(s => s.value);
             // jimeng-4.5模型只显示2K和4K两个选项
             if (modelId.includes('jimeng-4.5')) return ['2K', '4K'];
             return RESOLUTIONS;
@@ -1019,9 +1019,10 @@ You must design a visual composition that tells the story through **8 distinct p
             return { str: `${targetW}x${targetH}`, w: targetW, h: targetH };
         };
 
-        const getModelParams = (modelId, ratio, resolution) => {
+        const getModelParams = (modelId, ratio, resolution, modelName = '') => {
             // gpt-image-2: resolution 直接就是 size 字符串（如 "1024x1536"）
-            if (modelId.includes('gpt-image-2')) {
+            // 检查 modelId 或 modelName 是否包含 gpt-image-2
+            if (modelId.includes('gpt-image-2') || modelName.includes('gpt-image-2')) {
                 const [w, h] = (resolution || '1024x1024').split('x').map(Number);
                 return { sizeStr: resolution || '1024x1024', w, h };
             }
@@ -6625,7 +6626,7 @@ You must design a visual composition that tells the story through **8 distinct p
                 // 优先使用 options 中的 ratio，其次使用节点设置，最后使用默认值
                 let ratio = options.ratio || node?.settings?.ratio || (modelId.includes('grok') ? '3:2' : '1:1');
                 let resolution = node?.settings?.resolution || (modelId.includes('grok') ? '1080P' : 'Auto');
-                let { sizeStr, w, h } = getModelParams(modelId, ratio, resolution);
+                let { sizeStr, w, h } = getModelParams(modelId, ratio, resolution, config?.modelName);
 
                 // Auto Resolution Logic (Direct Source, No Scaling, Just Alignment)
                 // Fix: Only use source dimensions if Ratio is ALSO Auto. If user picks a ratio (e.g. 1:1), respect that.
@@ -14590,11 +14591,12 @@ You must design a visual composition that tells the story through **8 distinct p
                                                             {(() => {
                                                                 const currentModel = apiConfigsMap.get(node.settings?.model);
                                                                 const modelId = currentModel?.id || currentModel?.modelName || '';
+                                                                const modelName = currentModel?.modelName || '';
                                                                 // gpt-image-2 显示尺寸值（如 1024x1536）
-                                                                if (modelId.includes('gpt-image-2')) {
+                                                                if (modelName.includes('gpt-image-2') || modelId.includes('gpt-image-2')) {
                                                                     return node.settings?.resolution || '1024x1024';
                                                                 }
-                                                                const availableResolutions = getResolutionsForModel(modelId);
+                                                                const availableResolutions = getResolutionsForModel(modelId, modelName);
                                                                 const currentResolution = node.settings?.resolution || 'Auto';
                                                                 const displayResolution = availableResolutions.includes(currentResolution) 
                                                                     ? currentResolution 
@@ -14610,7 +14612,8 @@ You must design a visual composition that tells the story through **8 distinct p
                                                         {activeDropdown?.nodeId === node.id && activeDropdown.type === 'res' && (() => {
                                                             const currentModel = apiConfigsMap.get(node.settings?.model);
                                                             const modelId = currentModel?.id || currentModel?.modelName || '';
-                                                            const isGptImage2 = modelId.includes('gpt-image-2');
+                                                            const modelName = currentModel?.modelName || '';
+                                                            const isGptImage2 = modelName.includes('gpt-image-2') || modelId.includes('gpt-image-2');
                                                             return (
                                                                 <div
                                                                     className={`absolute bottom-full right-0 mb-1 ${isGptImage2 ? 'w-36' : 'w-24'} rounded-lg shadow-xl p-1 z-[60] border ${
@@ -14639,7 +14642,7 @@ You must design a visual composition that tells the story through **8 distinct p
                                                                             </button>
                                                                         ))
                                                                     ) : (
-                                                                        getResolutionsForModel(modelId).map(r => (
+                                                                        getResolutionsForModel(modelId, modelName).map(r => (
                                                                             <button
                                                                                 key={r}
                                                                                 onClick={() => {
