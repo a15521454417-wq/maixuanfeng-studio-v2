@@ -7056,9 +7056,16 @@ You must design a visual composition that tells the story through **8 distinct p
                             const jsonBody = { 
                                 model: config?.modelName || 'gpt-4o-image', 
                                 prompt: finalPrompt, 
-                                size: sizeStr, 
-                                aspect_ratio: ratio 
+                                size: sizeStr,
+                                response_format: 'url'
                             };
+                            
+                            // gpt-image-2 支持 quality 参数：low, medium, high, auto
+                            const isGptImage2 = (config?.modelName ?? '').includes('gpt-image-2');
+                            if (isGptImage2) {
+                                const quality = node?.settings?.gptImageQuality || 'auto';
+                                jsonBody.quality = quality;
+                            }
                             
                             if (connectedImages.length > 0) {
                                 const b64Promises = connectedImages.map(url => getBase64FromUrl(url));
@@ -14486,65 +14493,116 @@ You must design a visual composition that tells the story through **8 distinct p
                                                 const isMidjourney = currentModel && (currentModel.id.includes('mj') || currentModel.provider.toLowerCase().includes('midjourney'));
                                                 return !isMidjourney;
                                             })() ? (
-                                                <div className="relative">
-                                                    <button
-                                                        onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'res' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'res' }); }}
-                                                        className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border ${
-                                                            theme === 'dark'
-                                                                ? 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
-                                                                : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
-                                                        }`}
-                                                    >
-                                                        {(() => {
-                                                            const currentModel = apiConfigsMap.get(node.settings?.model);
-                                                            const modelId = currentModel?.id || currentModel?.modelName || '';
-                                                            const availableResolutions = getResolutionsForModel(modelId);
-                                                            const currentResolution = node.settings?.resolution || 'Auto';
-                                                            // 如果当前分辨率不在可用选项中，使用第一个可用选项作为显示值
-                                                            const displayResolution = availableResolutions.includes(currentResolution) 
-                                                                ? currentResolution 
-                                                                : (availableResolutions[0] || 'Auto');
-                                                            // 如果当前分辨率不在可用选项中，自动更新
-                                                            if (!availableResolutions.includes(currentResolution) && availableResolutions.length > 0) {
-                                                                setTimeout(() => {
-                                                                    updateNodeSettings(node.id, { resolution: availableResolutions[0] });
-                                                                }, 0);
-                                                            }
-                                                            return displayResolution;
-                                                        })()}
-                                                    </button>
-                                                    {activeDropdown?.nodeId === node.id && activeDropdown.type === 'res' && (() => {
+                                                <div className="flex items-center gap-1">
+                                                    {/* gpt-image-2 quality 选择器 */}
+                                                    {(() => {
                                                         const currentModel = apiConfigsMap.get(node.settings?.model);
-                                                        const modelId = currentModel?.id || currentModel?.modelName || '';
-                                                        const availableResolutions = getResolutionsForModel(modelId);
+                                                        const modelName = currentModel?.modelName || '';
+                                                        const isGptImage2 = modelName.includes('gpt-image-2');
+                                                        if (!isGptImage2) return null;
                                                         return (
-                                                            <div
-                                                                className={`absolute bottom-full right-0 mb-1 w-24 rounded-lg shadow-xl p-1 z-[60] border ${
-                                                                    theme === 'dark'
-                                                                        ? 'bg-[#18181b] border-zinc-700'
-                                                                        : 'bg-white border-zinc-200'
-                                                                }`}
-                                                                onMouseDown={e => e.stopPropagation()}
-                                                            >
-                                                                {availableResolutions.map(r => (
-                                                                    <button
-                                                                        key={r}
-                                                                        onClick={() => {
-                                                                            updateNodeSettings(node.id, { resolution: r });
-                                                                            setActiveDropdown(null);
-                                                                        }}
-                                                                        className={`w-full text-center py-1 text-[10px] rounded ${
+                                                            <div className="relative">
+                                                                <button
+                                                                    onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'gptq' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'gptq' }); }}
+                                                                    className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border ${
+                                                                        theme === 'dark'
+                                                                            ? 'bg-blue-900/30 hover:bg-blue-900/50 text-blue-300 border-blue-800/50'
+                                                                            : 'bg-blue-50 hover:bg-blue-100 text-blue-600 border-blue-200'
+                                                                    }`}
+                                                                    title="gpt-image-2 画质选项"
+                                                                >
+                                                                    Q: {node.settings?.gptImageQuality || 'auto'}
+                                                                </button>
+                                                                {activeDropdown?.nodeId === node.id && activeDropdown.type === 'gptq' && (
+                                                                    <div
+                                                                        className={`absolute bottom-full right-0 mb-1 w-24 rounded-lg shadow-xl p-1 z-[60] border ${
                                                                             theme === 'dark'
-                                                                                ? 'text-zinc-300 hover:bg-zinc-800'
-                                                                                : 'text-zinc-700 hover:bg-zinc-100'
+                                                                                ? 'bg-[#18181b] border-zinc-700'
+                                                                                : 'bg-white border-zinc-200'
                                                                         }`}
+                                                                        onMouseDown={e => e.stopPropagation()}
                                                                     >
-                                                                        {r}
-                                                                    </button>
-                                                                ))}
+                                                                        {['auto', 'low', 'medium', 'high'].map(q => (
+                                                                            <button
+                                                                                key={q}
+                                                                                onClick={() => {
+                                                                                    updateNodeSettings(node.id, { gptImageQuality: q });
+                                                                                    setActiveDropdown(null);
+                                                                                }}
+                                                                                className={`w-full text-center py-1 text-[10px] rounded ${
+                                                                                    theme === 'dark'
+                                                                                        ? 'text-zinc-300 hover:bg-zinc-800'
+                                                                                        : 'text-zinc-700 hover:bg-zinc-100'
+                                                                                }`}
+                                                                            >
+                                                                                {q}
+                                                                            </button>
+                                                                        ))}
+                                                                    </div>
+                                                                )}
                                                             </div>
                                                         );
                                                     })()}
+                                                    <div className="relative">
+                                                        <button
+                                                            onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'res' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'res' }); }}
+                                                            className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border ${
+                                                                theme === 'dark'
+                                                                    ? 'bg-zinc-800/50 hover:bg-zinc-800 text-zinc-400 border-zinc-700/50'
+                                                                    : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-600 border-zinc-300'
+                                                            }`}
+                                                        >
+                                                            {(() => {
+                                                                const currentModel = apiConfigsMap.get(node.settings?.model);
+                                                                const modelId = currentModel?.id || currentModel?.modelName || '';
+                                                                const availableResolutions = getResolutionsForModel(modelId);
+                                                                const currentResolution = node.settings?.resolution || 'Auto';
+                                                                // 如果当前分辨率不在可用选项中，使用第一个可用选项作为显示值
+                                                                const displayResolution = availableResolutions.includes(currentResolution) 
+                                                                    ? currentResolution 
+                                                                    : (availableResolutions[0] || 'Auto');
+                                                                // 如果当前分辨率不在可用选项中，自动更新
+                                                                if (!availableResolutions.includes(currentResolution) && availableResolutions.length > 0) {
+                                                                    setTimeout(() => {
+                                                                        updateNodeSettings(node.id, { resolution: availableResolutions[0] });
+                                                                    }, 0);
+                                                                }
+                                                                return displayResolution;
+                                                            })()}
+                                                        </button>
+                                                        {activeDropdown?.nodeId === node.id && activeDropdown.type === 'res' && (() => {
+                                                            const currentModel = apiConfigsMap.get(node.settings?.model);
+                                                            const modelId = currentModel?.id || currentModel?.modelName || '';
+                                                            const availableResolutions = getResolutionsForModel(modelId);
+                                                            return (
+                                                                <div
+                                                                    className={`absolute bottom-full right-0 mb-1 w-24 rounded-lg shadow-xl p-1 z-[60] border ${
+                                                                        theme === 'dark'
+                                                                            ? 'bg-[#18181b] border-zinc-700'
+                                                                            : 'bg-white border-zinc-200'
+                                                                    }`}
+                                                                    onMouseDown={e => e.stopPropagation()}
+                                                                >
+                                                                    {availableResolutions.map(r => (
+                                                                        <button
+                                                                            key={r}
+                                                                            onClick={() => {
+                                                                                updateNodeSettings(node.id, { resolution: r });
+                                                                                setActiveDropdown(null);
+                                                                            }}
+                                                                            className={`w-full text-center py-1 text-[10px] rounded ${
+                                                                                theme === 'dark'
+                                                                                    ? 'text-zinc-300 hover:bg-zinc-800'
+                                                                                    : 'text-zinc-700 hover:bg-zinc-100'
+                                                                            }`}
+                                                                        >
+                                                                            {r}
+                                                                        </button>
+                                                                    ))}
+                                                                </div>
+                                                            );
+                                                        })()}
+                                                    </div>
                                                 </div>
                                             ) : (
                                                 (() => {
