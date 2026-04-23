@@ -7090,7 +7090,7 @@ You must design a visual composition that tells the story through **8 distinct p
                         else if (isOpenAIImage) {
                             let finalPrompt = prompt || '';
                             const jsonBody = { 
-                                model: config?.modelName || 'gpt-4o-image', 
+                                model: config?.modelName || 'gpt-image-2', 
                                 prompt: finalPrompt, 
                                 size: sizeStr,
                                 response_format: 'url'
@@ -7108,6 +7108,7 @@ You must design a visual composition that tells the story through **8 distinct p
                                 const b64s = await Promise.all(b64Promises);
                                 jsonBody.image = b64s.map(b => `data:image/png;base64,${b}`);
                             }
+                            console.log('[gpt-image-2] 请求构建完成:', { model: jsonBody.model, size: jsonBody.size, quality: jsonBody.quality, hasImages: !!jsonBody.image, promptLength: finalPrompt.length });
                             payload = jsonBody;
                     } else if (isNanoBanana2) {
                         // Nano-banana-2 统一使用 /v1/images/generations (application/json)
@@ -7640,14 +7641,17 @@ You must design a visual composition that tells the story through **8 distinct p
                         const requestBody = useMultipart ? payload : JSON.stringify(payload);
                         const bodySize = typeof requestBody === 'string' ? requestBody.length : 'FormData';
                         
-                        console.log('[即梦API] 发送请求:', {
+                        const logModelName = isJimeng ? '即梦API' : isOpenAIImage ? 'gpt-image' : isNanoBanana2 ? 'NanoBanana2' : isFluxKontext ? 'FluxKontext' : isMidjourney ? 'Midjourney' : 'ImageAPI';
+                        console.log(`[${logModelName}] 发送请求:`, {
                             url: fullUrl,
                             method: 'POST',
                             headers: { ...headers, Authorization: 'Bearer ***' }, // 隐藏敏感信息
                             useMultipart,
                             bodySize: typeof bodySize === 'number' ? `${(bodySize / 1024 / 1024).toFixed(2)}MB` : bodySize,
-                            imageCount: payload.images ? payload.images.length : 0,
+                            imageCount: payload.images ? payload.images.length : (payload.image ? payload.image.length : 0),
                             model: payload.model, // 显示实际发送的模型名称
+                            size: payload.size,
+                            quality: payload.quality,
                             modelId, // 显示用户选择的modelId
                             configModelName: config?.modelName // 显示配置中的modelName
                         });
