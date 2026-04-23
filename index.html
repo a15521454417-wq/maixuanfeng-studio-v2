@@ -830,7 +830,7 @@
             { id: 'nano-banana', provider: 'Nano Banana', modelName: 'nano-banana', type: 'Image', key: '', url: DEFAULT_BASE_URL },
             { id: 'nano-banana-2', provider: 'Nano Banana 2', modelName: 'nano-banana-2', type: 'Image', key: '', url: DEFAULT_BASE_URL },
             { id: 'gemini-3.1-flash-image-preview', provider: 'Gemini 3.1 Flash Image', modelName: 'gemini-3.1-flash-image-preview', type: 'Image', key: '', url: DEFAULT_BASE_URL, defaultResolution: '4K' },
-            { id: 'gpt-image', provider: 'GPT-4o Image', modelName: 'gpt-4o-image', type: 'Image', key: '', url: DEFAULT_BASE_URL },
+            { id: 'gpt-image', provider: 'gpt-image-2', modelName: 'gpt-image-2', type: 'Image', key: '', url: DEFAULT_BASE_URL },
             { id: 'flux-kontext', provider: 'Flux Kontext', modelName: 'flux-kontext-pro', type: 'Image', key: '', url: DEFAULT_BASE_URL },
             { id: 'mj-v6', provider: 'Midjourney', modelName: 'MJ V6', type: 'Image', key: '', url: 'https://api.midjourney.com' },
             // GRS AI（国内直连，支持 Nano Banana 全系列模型）
@@ -6717,7 +6717,7 @@ You must design a visual composition that tells the story through **8 distinct p
                         let useMultipart = false;
 
                         const isBananaLike = (modelId.includes('banana') || modelId.includes('edit') || modelId.includes('qwen')) && !(modelId.includes('nano-banana-2') || (config?.modelName ?? '').includes('nano-banana-2'));
-                        const isOpenAIImage = modelId.includes('gpt') || (config?.modelName ?? '').includes('gpt-image') || (config?.provider ?? '').toLowerCase().includes('gpt-4o image');
+                        const isOpenAIImage = modelId.includes('gpt') || (config?.modelName ?? '').includes('gpt-image') || (config?.provider ?? '').toLowerCase().includes('gpt');
                         const isFluxKontext = modelId.includes('flux') || (config?.modelName ?? '').includes('flux-kontext');
                     const isNanoBanana2 = (config?.modelName ?? '').includes('nano-banana-2') || modelId.includes('nano-banana-2') || modelId.includes('gemini-3.1-flash-image') || (config?.modelName ?? '').includes('gemini-3.1-flash-image');
                     const isMidjourney = modelId.includes('mj') || (config?.provider ?? '').toLowerCase().includes('midjourney');
