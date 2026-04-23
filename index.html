@@ -952,8 +952,21 @@ You must design a visual composition that tells the story through **8 distinct p
         };
         const RESOLUTIONS = ['Auto', '1K', '2K', '4K'];
         // 根据模型返回不同的分辨率选项
+        // gpt-image-2 支持的精确分辨率列表（按文档规范）
+        const GPT_IMAGE2_SIZES = [
+            { value: '1024x1024', label: '1:1 方形' },
+            { value: '1536x1024', label: '3:2 横向' },
+            { value: '1024x1536', label: '2:3 竖屏' },
+            { value: '2048x2048', label: '2K 方形' },
+            { value: '2048x1152', label: '2K 横向' },
+            { value: '3840x2160', label: '4K 横向' },
+            { value: '2160x3840', label: '4K 竖屏' },
+        ];
+
         const getResolutionsForModel = (modelId) => {
             if (!modelId) return RESOLUTIONS;
+            // gpt-image-2 使用精确尺寸列表
+            if (modelId.includes('gpt-image-2')) return GPT_IMAGE2_SIZES.map(s => s.value);
             // jimeng-4.5模型只显示2K和4K两个选项
             if (modelId.includes('jimeng-4.5')) return ['2K', '4K'];
             return RESOLUTIONS;
@@ -1007,6 +1020,11 @@ You must design a visual composition that tells the story through **8 distinct p
         };
 
         const getModelParams = (modelId, ratio, resolution) => {
+            // gpt-image-2: resolution 直接就是 size 字符串（如 "1024x1536"）
+            if (modelId.includes('gpt-image-2')) {
+                const [w, h] = (resolution || '1024x1024').split('x').map(Number);
+                return { sizeStr: resolution || '1024x1024', w, h };
+            }
             const { str, w, h } = calculateResolution(ratio, resolution);
             if (modelId.includes('minimax')) {
                 return { sizeStr: resolution === '4K' ? '1080p' : '720p', w, h };
@@ -14555,13 +14573,15 @@ You must design a visual composition that tells the story through **8 distinct p
                                                             {(() => {
                                                                 const currentModel = apiConfigsMap.get(node.settings?.model);
                                                                 const modelId = currentModel?.id || currentModel?.modelName || '';
+                                                                // gpt-image-2 显示尺寸值（如 1024x1536）
+                                                                if (modelId.includes('gpt-image-2')) {
+                                                                    return node.settings?.resolution || '1024x1024';
+                                                                }
                                                                 const availableResolutions = getResolutionsForModel(modelId);
                                                                 const currentResolution = node.settings?.resolution || 'Auto';
-                                                                // 如果当前分辨率不在可用选项中，使用第一个可用选项作为显示值
                                                                 const displayResolution = availableResolutions.includes(currentResolution) 
                                                                     ? currentResolution 
                                                                     : (availableResolutions[0] || 'Auto');
-                                                                // 如果当前分辨率不在可用选项中，自动更新
                                                                 if (!availableResolutions.includes(currentResolution) && availableResolutions.length > 0) {
                                                                     setTimeout(() => {
                                                                         updateNodeSettings(node.id, { resolution: availableResolutions[0] });
@@ -14573,32 +14593,52 @@ You must design a visual composition that tells the story through **8 distinct p
                                                         {activeDropdown?.nodeId === node.id && activeDropdown.type === 'res' && (() => {
                                                             const currentModel = apiConfigsMap.get(node.settings?.model);
                                                             const modelId = currentModel?.id || currentModel?.modelName || '';
-                                                            const availableResolutions = getResolutionsForModel(modelId);
+                                                            const isGptImage2 = modelId.includes('gpt-image-2');
                                                             return (
                                                                 <div
-                                                                    className={`absolute bottom-full right-0 mb-1 w-24 rounded-lg shadow-xl p-1 z-[60] border ${
+                                                                    className={`absolute bottom-full right-0 mb-1 ${isGptImage2 ? 'w-36' : 'w-24'} rounded-lg shadow-xl p-1 z-[60] border ${
                                                                         theme === 'dark'
                                                                             ? 'bg-[#18181b] border-zinc-700'
                                                                             : 'bg-white border-zinc-200'
                                                                     }`}
                                                                     onMouseDown={e => e.stopPropagation()}
                                                                 >
-                                                                    {availableResolutions.map(r => (
-                                                                        <button
-                                                                            key={r}
-                                                                            onClick={() => {
-                                                                                updateNodeSettings(node.id, { resolution: r });
-                                                                                setActiveDropdown(null);
-                                                                            }}
-                                                                            className={`w-full text-center py-1 text-[10px] rounded ${
-                                                                                theme === 'dark'
-                                                                                    ? 'text-zinc-300 hover:bg-zinc-800'
-                                                                                    : 'text-zinc-700 hover:bg-zinc-100'
-                                                                            }`}
-                                                                        >
-                                                                            {r}
-                                                                        </button>
-                                                                    ))}
+                                                                    {isGptImage2 ? (
+                                                                        GPT_IMAGE2_SIZES.map(s => (
+                                                                            <button
+                                                                                key={s.value}
+                                                                                onClick={() => {
+                                                                                    updateNodeSettings(node.id, { resolution: s.value });
+                                                                                    setActiveDropdown(null);
+                                                                                }}
+                                                                                className={`w-full flex items-center justify-between px-2 py-1 text-left text-[10px] rounded ${
+                                                                                    theme === 'dark'
+                                                                                        ? 'text-zinc-300 hover:bg-zinc-800'
+                                                                                        : 'text-zinc-700 hover:bg-zinc-100'
+                                                                                } ${node.settings?.resolution === s.value ? (theme === 'dark' ? 'bg-blue-900/30 text-blue-300' : 'bg-blue-50 text-blue-700') : ''}`}
+                                                                            >
+                                                                                <span>{s.label}</span>
+                                                                                <span className="font-mono opacity-60">{s.value}</span>
+                                                                            </button>
+                                                                        ))
+                                                                    ) : (
+                                                                        getResolutionsForModel(modelId).map(r => (
+                                                                            <button
+                                                                                key={r}
+                                                                                onClick={() => {
+                                                                                    updateNodeSettings(node.id, { resolution: r });
+                                                                                    setActiveDropdown(null);
+                                                                                }}
+                                                                                className={`w-full text-center py-1 text-[10px] rounded ${
+                                                                                    theme === 'dark'
+                                                                                        ? 'text-zinc-300 hover:bg-zinc-800'
+                                                                                        : 'text-zinc-700 hover:bg-zinc-100'
+                                                                                }`}
+                                                                            >
+                                                                                {r}
+                                                                            </button>
+                                                                        ))
+                                                                    )}
                                                                 </div>
                                                             );
                                                         })()}
