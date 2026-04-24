@@ -952,21 +952,46 @@ You must design a visual composition that tells the story through **8 distinct p
         };
         const RESOLUTIONS = ['Auto', '1K', '2K', '4K'];
         // 根据模型返回不同的分辨率选项
-        // gpt-image-2 支持的精确分辨率列表（按文档规范）
-        const GPT_IMAGE2_SIZES = [
-            { value: '1024x1024', label: '1:1 方形' },
-            { value: '1536x1024', label: '3:2 横向' },
-            { value: '1024x1536', label: '2:3 竖屏' },
-            { value: '2048x2048', label: '2K 方形' },
-            { value: '2048x1152', label: '2K 横向' },
-            { value: '3840x2160', label: '4K 横向' },
-            { value: '2160x3840', label: '4K 竖屏' },
-        ];
+        // gpt-image-2 支持的精确分辨率列表（像素预算≤8,294,400，16px倍数）
+        // gpt-image-2 分辨率档位：1K / 2K / 4K（与 Comfly 官方 nodes_openai.py 一致）
+        const GPT_IMAGE2_TIERS = ['1K', '2K', '4K'];
+        // gpt-image-2 完整 13 种比例尺寸表（与 Comfly 官方一致，像素预算≤8,294,400）
+        const GPT_IMAGE2_SIZE_MAP = {
+            // 比例 → { '1K': sizeStr, '2K': sizeStr, '4K': sizeStr }
+            '1:1':    { '1K': '1024x1024',   '2K': '2048x2048',   '4K': null },           // 4K 超限
+            '16:9':   { '1K': '1536x864',    '2K': '2048x1152',   '4K': '3840x2160' },
+            '9:16':   { '1K': '864x1536',    '2K': '1152x2048',   '4K': '2160x3840' },
+            '3:2':    { '1K': '1536x1024',   '2K': '2048x1360',   '4K': null },
+            '2:3':    { '1K': '1024x1536',   '2K': '1360x2048',   '4K': null },
+            '4:3':    { '1K': '1024x768',    '2K': '2048x1536',   '4K': null },
+            '3:4':    { '1K': '768x1024',    '2K': '1536x2048',   '4K': null },
+            '5:4':    { '1K': '1280x1024',   '2K': '2560x2048',   '4K': null },
+            '4:5':    { '1K': '1024x1280',   '2K': '2048x2560',   '4K': null },
+            '2:1':    { '1K': '2048x1024',   '2K': '2688x1344',   '4K': '3840x1920' },
+            '1:2':    { '1K': '1024x2048',   '2K': '1344x2688',   '4K': '1920x3840' },
+            '21:9':   { '1K': '2016x864',    '2K': '2688x1152',   '4K': '3840x1648' },
+            '9:21':   { '1K': '864x2016',    '2K': '1152x2688',   '4K': '1648x3840' },
+        };
+        const GPT_IMAGE2_RATIOS = Object.keys(GPT_IMAGE2_SIZE_MAP);
+        // 默认选中的比例和档位
+        const GPT_IMAGE2_DEFAULT_RATIO = '16:9';
+        const GPT_IMAGE2_DEFAULT_TIER = '4K';
+
+        // 向下兼容：旧版直接存 sizeStr 的配置，自动映射到新 ratio+tier 格式
+        const parseGptImage2Resolution = (resStr) => {
+            if (!resStr) return { ratio: GPT_IMAGE2_DEFAULT_RATIO, tier: GPT_IMAGE2_DEFAULT_TIER };
+            for (const [ratio, tiers] of Object.entries(GPT_IMAGE2_SIZE_MAP)) {
+                for (const [tier, size] of Object.entries(tiers)) {
+                    if (size === resStr) return { ratio, tier };
+                }
+            }
+            return { ratio: GPT_IMAGE2_DEFAULT_RATIO, tier: GPT_IMAGE2_DEFAULT_TIER };
+        };
 
         const getResolutionsForModel = (modelId, modelName = '') => {
             if (!modelId) return RESOLUTIONS;
-            // gpt-image-2 使用精确尺寸列表（检查 id 或 modelName）
-            if (modelId.includes('gpt-image-2') || modelName.includes('gpt-image-2')) return GPT_IMAGE2_SIZES.map(s => s.value);
+            // gpt-image-2 使用 1K/2K/4K 档位选择（检查 id 或 modelName）
+            if (modelId.includes('gpt-image-2') || modelName.includes('gpt-image-2')) return GPT_IMAGE2_TIERS;
             // jimeng-4.5模型只显示2K和4K两个选项
             if (modelId.includes('jimeng-4.5')) return ['2K', '4K'];
             return RESOLUTIONS;
@@ -1020,11 +1045,24 @@ You must design a visual composition that tells the story through **8 distinct p
         };
 
         const getModelParams = (modelId, ratio, resolution, modelName = '') => {
-            // gpt-image-2: resolution 直接就是 size 字符串（如 "1024x1536"）
-            // 检查 modelId 或 modelName 是否包含 gpt-image-2
+            // gpt-image-2: resolution 是档位(1K/2K/4K) + ratio 共同决定 size（与 Comfly 官方一致）
             if (modelId.includes('gpt-image-2') || modelName.includes('gpt-image-2')) {
-                const [w, h] = (resolution || '1024x1024').split('x').map(Number);
-                return { sizeStr: resolution || '1024x1024', w, h };
+                // 向下兼容：如果 resolution 已经是 "WxH" 格式（旧配置），尝试解析
+                const parsed = parseGptImage2Resolution(resolution);
+                let useRatio = ratio === 'Auto' ? GPT_IMAGE2_DEFAULT_RATIO : ratio;
+                let useTier = resolution;
+                if (GPT_IMAGE2_TIERS.includes(resolution)) {
+                    // 新格式：resolution 就是档位
+                    useTier = resolution;
+                } else if (parsed.tier) {
+                    // 旧格式：resolution 是 sizeStr，解析回档位
+                    useRatio = parsed.ratio;
+                    useTier = parsed.tier;
+                }
+                const sizeStr = GPT_IMAGE2_SIZE_MAP[useRatio]?.[useTier] || GPT_IMAGE2_SIZE_MAP[GPT_IMAGE2_DEFAULT_RATIO][useTier];
+                if (!sizeStr) { /* 该比例不支持该档位，fallback 到默认 */ }
+                const [w, h] = (sizeStr || '1024x1024').split('x').map(Number);
+                return { sizeStr, w, h };
             }
             const { str, w, h } = calculateResolution(ratio, resolution);
             if (modelId.includes('minimax')) {
@@ -4088,6 +4126,40 @@ You must design a visual composition that tells the story through **8 distinct p
                 return await res.blob();
             };
 
+            // gpt-image-2 输入图缩放：Comfly 官方要求参考图像素数 ≤ 1572864 (~1536×1024)
+            // 与 Comfly nodes_openai.py 的 downscale_input() 一致
+            const downscaleInputImage = async (imageUrl, maxPixels = 1572864) => {
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => {
+                        const origW = img.width;
+                        const origH = img.height;
+                        const origPixels = origW * origH;
+                        if (origPixels <= maxPixels) {
+                            // 无需缩放，直接返回原始 blob
+                            getBlobFromUrl(imageUrl).then(resolve).catch(reject);
+                            return;
+                        }
+                        const scale = Math.sqrt(maxPixels / origPixels);
+                        const newW = Math.round(origW * scale);
+                        const newH = Math.round(origH * scale);
+                        const canvas = document.createElement('canvas');
+                        canvas.width = newW;
+                        canvas.height = newH;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, newW, newH);
+                        canvas.toBlob(blob => {
+                            if (blob) resolve(blob);
+                            else reject(new Error('Canvas toBlob failed'));
+                        }, 'image/png');
+                        console.log(`[gpt-image-2] 参考图缩放: ${origW}x${origH} → ${newW}x${newH}`);
+                    };
+                    img.onerror = () => reject(new Error(`Failed to load image: ${imageUrl}`));
+                    img.src = imageUrl;
+                });
+            };
+
             const getBase64FromUrl = async (url) => {
                 if (url.startsWith('data:')) {
                     return url.split(',')[1];
@@ -6540,6 +6612,124 @@ You must design a visual composition that tells the story through **8 distinct p
                 }
             };
 
+            // gpt-image-2 官方分组异步轮询
+            const pollGptImage2Task = async (taskId, remoteTaskId, baseUrl, apiKey, w, h, sourceNodeId, attempt = 0) => {
+                const maxAttempts = 300;
+                const pollInterval = 5000; // 5秒
+                const delayMs = Math.min(pollInterval, 60000);
+                const queryUrl = `${baseUrl}/v1/images/tasks/${remoteTaskId}`;
+
+                console.log(`[gpt-image-2] 轮询任务状态: ${remoteTaskId}, 第 ${attempt + 1}/${maxAttempts} 次`);
+
+                try {
+                    const resp = await fetch(queryUrl, {
+                        method: 'GET',
+                        headers: { Authorization: `Bearer ${apiKey}` }
+                    });
+
+                    if (resp.status !== 200) {
+                        console.warn(`[gpt-image-2] 轮询返回非200: ${resp.status}`);
+                        if (attempt < maxAttempts - 1) {
+                            setTimeout(() => pollGptImage2Task(taskId, remoteTaskId, baseUrl, apiKey, w, h, sourceNodeId, attempt + 1), delayMs);
+                        }
+                        return;
+                    }
+
+                    const statusData = await resp.json();
+                    const inner = statusData?.data || {};
+                    const status = inner.status || '';
+                    const progressStr = inner.progress || '0%';
+                    let progressValue = 10;
+                    try {
+                        if (typeof progressStr === 'string' && progressStr.endsWith('%')) {
+                            progressValue = Math.min(95, 10 + parseInt(progressStr, 10) * 0.85);
+                        }
+                    } catch (e) { /* ignore */ }
+
+                    console.log(`[gpt-image-2] 状态: ${status}, 进度: ${progressStr}`);
+
+                    if (status === 'SUCCESS') {
+                        const resultData = inner.data || {};
+                        const dataArray = resultData.data || [];
+                        if (dataArray.length > 0) {
+                            const firstItem = dataArray[0];
+                            const imageUrl = firstItem.url || '';
+                            const b64Json = firstItem.b64_json || '';
+
+                            // [修复4] 优先使用 URL，fallback 到 b64_json 解码（与 Comfly 官方一致）
+                            let finalUrl = imageUrl;
+                            if (!finalUrl && b64Json) {
+                                try {
+                                    const binaryData = atob(b64Json);
+                                    const bytes = new Uint8Array(binaryData.length);
+                                    for (let i = 0; i < binaryData.length; i++) bytes[i] = binaryData.charCodeAt(i);
+                                    const blob = new Blob([bytes], { type: 'image/png' });
+                                    finalUrl = URL.createObjectURL(blob);
+                                    console.log('[gpt-image-2] 从 b64_json 解码生成图片 URL');
+                                } catch (b64Err) {
+                                    console.error('[gpt-image-2] b64_json 解码失败:', b64Err);
+                                }
+                            }
+
+                            if (finalUrl) {
+                                // 更新历史记录
+                                setHistory((prev) => prev.map((hItem) =>
+                                    hItem.id === taskId
+                                        ? { ...hItem, status: 'completed', progress: 100, url: finalUrl, width: w, height: h }
+                                        : hItem
+                                ));
+                                // 更新节点
+                                if (sourceNodeId) {
+                                    setNodes((prev) => prev.map((n) =>
+                                        n.id === sourceNodeId ? { ...n, content: finalUrl } : n
+                                    ));
+                                }
+                                console.log(`[gpt-image-2] 任务完成，图片URL: ${finalUrl.substring(0, 80)}...`);
+                            } else {
+                                throw new Error('任务完成但未返回图片URL或b64_json');
+                            }
+                        } else {
+                            throw new Error('任务完成但无图片数据');
+                        }
+                        return;
+                    } else if (status === 'FAILURE') {
+                        const failReason = inner.fail_reason || 'Unknown error';
+                        throw new Error(`任务失败: ${failReason}`);
+                    }
+
+                    // 更新进度
+                    setHistory((prev) => prev.map((hItem) =>
+                        hItem.id === taskId
+                            ? { ...hItem, status: 'generating', progress: Math.round(progressValue) }
+                            : hItem
+                    ));
+
+                    // 继续轮询
+                    if (attempt < maxAttempts - 1) {
+                        setTimeout(() => pollGptImage2Task(taskId, remoteTaskId, baseUrl, apiKey, w, h, sourceNodeId, attempt + 1), delayMs);
+                    } else {
+                        throw new Error(`轮询超时，超过最大尝试次数 ${maxAttempts}`);
+                    }
+                } catch (err) {
+                    const errMsg = err.message || String(err);
+                    // 524 = Cloudflare 超时，5xx = 服务器临时错误，这些应该继续轮询
+                    const isNetworkError = errMsg.includes('524') || errMsg.includes('522') || errMsg.includes('523') ||
+                                          errMsg.includes('status: 5') || errMsg.includes('Failed to fetch') ||
+                                          errMsg.includes('timeout') || errMsg.includes('network');
+                    if (isNetworkError && attempt < maxAttempts - 1) {
+                        console.warn(`[gpt-image-2] 轮询网络错误 (${errMsg})，继续重试 [${attempt + 1}/${maxAttempts}]`);
+                        setTimeout(() => pollGptImage2Task(taskId, remoteTaskId, baseUrl, apiKey, w, h, sourceNodeId, attempt + 1), delayMs);
+                        return;
+                    }
+                    console.error(`[gpt-image-2] 轮询错误:`, err);
+                    setHistory((prev) => prev.map((hItem) =>
+                        hItem.id === taskId
+                            ? { ...hItem, status: 'failed', errorMsg: errMsg }
+                            : hItem
+                    ));
+                }
+            };
+
             const startGeneration = async (prompt, type, sourceImages, nodeId, options = {}) => {
                 const connectedImages = Array.isArray(sourceImages) ? sourceImages : (sourceImages ? [sourceImages] : []);
                 const sourceImage = connectedImages.length > 0 ? connectedImages[0] : undefined;
@@ -6625,6 +6815,14 @@ You must design a visual composition that tells the story through **8 distinct p
                 // 优先使用 options 中的 ratio，其次使用节点设置，最后使用默认值
                 let ratio = options.ratio || node?.settings?.ratio || (modelId.includes('grok') ? '3:2' : '1:1');
                 let resolution = node?.settings?.resolution || (modelId.includes('grok') ? '1080P' : 'Auto');
+                // [修复3] gpt-image-2：优先使用专用字段 gptImageRatio/gptImageTier，覆盖旧 ratio/resolution
+                const isOpenAIImageModel = (modelId.includes('gpt-image') || (config?.modelName || '').includes('gpt-image'));
+                if (isOpenAIImageModel && node?.settings?.gptImageRatio) {
+                    ratio = node.settings.gptImageRatio;
+                }
+                if (isOpenAIImageModel && node?.settings?.gptImageTier) {
+                    resolution = node.settings.gptImageTier;
+                }
                 let { sizeStr, w, h } = getModelParams(modelId, ratio, resolution, config?.modelName);
 
                 // Auto Resolution Logic (Direct Source, No Scaling, Just Alignment)
@@ -7087,28 +7285,57 @@ You must design a visual composition that tells the story through **8 distinct p
                             payload = formData;
                         }
                         else if (isOpenAIImage) {
-                            let finalPrompt = prompt || '';
-                            const jsonBody = { 
-                                model: config?.modelName || 'gpt-image-2', 
-                                prompt: finalPrompt, 
-                                size: sizeStr,
-                                response_format: 'url'
-                            };
-                            
-                            // gpt-image-2 支持 quality 参数：low, medium, high, auto
-                            const isGptImage2 = (config?.modelName ?? '').includes('gpt-image-2');
-                            if (isGptImage2) {
-                                const quality = node?.settings?.gptImageQuality || 'auto';
-                                jsonBody.quality = quality;
+                            // gpt-image-2 官方分组使用 multipart/form-data 格式（Comfly_gpt_image_2_official）
+                            // 端点：/v1/images/edits?async=true（必须异步模式才能出4K）
+                            endpoint = `${baseUrl}/v1/images/edits?async=true`;
+                            useMultipart = true;
+                            const formData = new FormData();
+
+                            const finalPrompt = prompt || '';
+                            formData.append('model', config?.modelName || 'gpt-image-2');
+                            formData.append('prompt', finalPrompt);
+                            formData.append('n', '1');
+                            formData.append('quality', node?.settings?.gptImageQuality || 'auto');
+                            formData.append('moderation', 'auto');
+                            // [修复2] 添加 background 参数（Comfly 官方支持 auto/opaque）
+                            formData.append('background', 'auto');
+                            formData.append('output_format', 'png');
+                            formData.append('output_compression', '100');
+
+                            // size 只在非 auto 时传
+                            if (sizeStr && sizeStr !== 'auto') {
+                                formData.append('size', sizeStr);
                             }
-                            
+
+                            // [修复1] 参考图：使用 Blob 格式，并通过 downscaleInputImage 缩放到 ≤157万像素
+                            // Comfly 官方要求输入图像素数不超过 ~1536×1024 (1572864)
                             if (connectedImages.length > 0) {
-                                const b64Promises = connectedImages.map(url => getBase64FromUrl(url));
-                                const b64s = await Promise.all(b64Promises);
-                                jsonBody.image = b64s.map(b => `data:image/png;base64,${b}`);
+                                const blobPromises = connectedImages.map(url => downscaleInputImage(url));
+                                const blobs = await Promise.all(blobPromises);
+                                blobs.forEach((blob, i) => {
+                                    formData.append('image', blob, `input_${i}.png`);
+                                });
+                                console.log('[gpt-image-2] 参考图数量:', blobs.length, '(已缩放至 ≤1536×1024)');
+                            } else {
+                                // [修复6] 纯文生图：生成 1x1 透明 PNG 作为最小占位图（Comfly 官方做法）
+                                const placeholderCanvas = document.createElement('canvas');
+                                placeholderCanvas.width = 1;
+                                placeholderCanvas.height = 1;
+                                const placeholderBlob = await new Promise(resolve => {
+                                    placeholderCanvas.toBlob(resolve, 'image/png');
+                                });
+                                formData.append('image', placeholderBlob, 'blank.png');
+                                console.log('[gpt-image-2] 纯文生图，使用 1x1 透明占位图');
                             }
-                            console.log('[gpt-image-2] 请求构建完成:', { model: jsonBody.model, size: jsonBody.size, quality: jsonBody.quality, hasImages: !!jsonBody.image, promptLength: finalPrompt.length });
-                            payload = jsonBody;
+
+                            // 蒙版（Inpainting）
+                            if (finalMaskBlob) {
+                                formData.append('mask', finalMaskBlob, 'mask.png');
+                                console.log('[Inpainting] 已添加处理后的蒙版数据');
+                            }
+
+                            console.log('[gpt-image-2 Official] 请求构建完成 (multipart/async):', { model: config?.modelName || 'gpt-image-2', size: sizeStr, quality: node?.settings?.gptImageQuality || 'auto', hasImages: connectedImages.length > 0, promptLength: finalPrompt.length, background: 'auto' });
+                            payload = formData;
                     } else if (isNanoBanana2) {
                         // Nano-banana-2 统一使用 /v1/images/generations (application/json)
                         // 有参考图时通过 image 数组传递，无参考图时不传 image
@@ -7657,11 +7884,59 @@ You must design a visual composition that tells the story through **8 distinct p
                         
                         let resp;
                         try {
-                            resp = await fetch(fullUrl, {
-                                method: 'POST',
-                                headers: headers,
-                                body: requestBody,
-                            });
+                            // [修复5] gpt-image-2 请求重试机制（与 Comfly 官方一致：指数退避，最多5次）
+                            // 非 gpt-image-2 模型直接发送，不重试
+                            if (isOpenAIImage) {
+                                const maxRetries = 5;
+                                const initialTimeoutMs = 120000; // 首次超时120秒
+                                for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                                    console.log(`[gpt-image-2] 发送请求 (第${attempt + 1}/${maxRetries + 1}次):`, { url: fullUrl, bodySize: typeof requestBody === 'string' ? `${(requestBody.length / 1024 / 1024).toFixed(2)}MB` : 'FormData' });
+                                    try {
+                                        const controller = new AbortController();
+                                        const timeoutMs = Math.round(initialTimeoutMs * Math.pow(1.5, attempt));
+                                        const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 1200000)); // 最大20分钟
+                                        resp = await fetch(fullUrl, {
+                                            method: 'POST',
+                                            headers: headers,
+                                            body: requestBody,
+                                            signal: controller.signal,
+                                        });
+                                        clearTimeout(timer);
+                                        // 400/401/403 客户端错误不重试
+                                        if ([400, 401, 403].includes(resp.status)) {
+                                            break;
+                                        }
+                                        if (resp.ok || resp.status < 500) {
+                                            break; // 成功或非服务器错误，跳出重试
+                                        }
+                                        // 5xx 服务器错误，准备重试
+                                        if (attempt < maxRetries) {
+                                            const waitMs = Math.min(Math.pow(2, attempt) * 1000, 60000); // 1s, 2s, 4s... 最大60s
+                                            console.warn(`[gpt-image-2] 服务器错误 ${resp.status}, ${waitMs}ms 后重试 (${attempt + 1}/${maxRetries})`);
+                                            await new Promise(r => setTimeout(r, waitMs));
+                                            continue;
+                                        }
+                                    } catch (fetchErr) {
+                                        if (fetchErr.name === 'AbortError') {
+                                            console.warn(`[gpt-image-2] 请求超时 (${Math.min(Math.round(initialTimeoutMs * Math.pow(1.5, attempt)), 1200000)}ms)`);
+                                        } else {
+                                            console.warn(`[gpt-image-2] 网络错误:`, fetchErr.message);
+                                        }
+                                        if (attempt < maxRetries) {
+                                            const waitMs = Math.min(Math.pow(2, attempt) * 1000, 60000);
+                                            await new Promise(r => setTimeout(r, waitMs));
+                                            continue;
+                                        }
+                                        throw fetchErr; // 最后一次尝试失败后抛出
+                                    }
+                                }
+                            } else {
+                                resp = await fetch(fullUrl, {
+                                    method: 'POST',
+                                    headers: headers,
+                                    body: requestBody,
+                                });
+                            }
                         } catch (fetchError) {
                             // 根据模型类型显示不同的错误信息
                             const isJimengModel = isJimeng;
@@ -7874,20 +8149,56 @@ You must design a visual composition that tells the story through **8 distinct p
                         } else {
                             // 其他模型（OpenAI格式）
                             console.log('[Image API] 响应数据:', data);
-                            
+
                             // 检查是否有错误
                             if (data?.error) {
                                 const errorMsg = data.error.message || data.error || 'Unknown error';
                                 console.error('[Image API] 错误响应:', JSON.stringify(data, null, 2));
                                 throw new Error(`Image API错误: ${errorMsg}`);
                             }
-                            
+
+                            // gpt-image-2 官方分组异步模式：检测 task_id
+                            const isGptImage2Official = (config?.modelName ?? '').includes('gpt-image-2');
+                            const remoteTaskId = data?.task_id || data?.data;
+                            if (isGptImage2Official && remoteTaskId && typeof remoteTaskId === 'string') {
+                                console.log('[gpt-image-2] 异步模式：收到 task_id:', remoteTaskId, '启动轮询');
+                                // 更新历史记录状态
+                                setHistory((prev) => prev.map((hItem) =>
+                                    hItem.id === taskId
+                                        ? { ...hItem, status: 'generating', progress: 10, remoteTaskId }
+                                        : hItem
+                                ));
+                                // 启动轮询
+                                const historyItem = historyMap.get(taskId);
+                                const sourceNodeId = historyItem?.sourceNodeId;
+                                pollGptImage2Task(taskId, remoteTaskId, baseUrl, apiKey, w, h, sourceNodeId, 0);
+                                return; // 异步模式：等待轮询完成
+                            }
+
                             imageData = data?.data || [];
                             if (!imageData || imageData.length === 0) {
                                 console.error('[Image API] 响应数据:', data);
                                 throw new Error('No Image URL found in response');
                             }
-                            imageUrls = imageData.map(item => item?.url).filter(Boolean);
+                            // [修复4] 优先使用 URL，fallback 到 b64_json 解码（与 Comfly 官方一致）
+                            imageUrls = imageData.map(item => {
+                                if (item?.url) return item.url;
+                                const b64 = item?.b64_json;
+                                if (b64) {
+                                    try {
+                                        const binaryData = atob(b64);
+                                        const bytes = new Uint8Array(binaryData.length);
+                                        for (let i = 0; i < binaryData.length; i++) bytes[i] = binaryData.charCodeAt(i);
+                                        const blob = new Blob([bytes], { type: 'image/png' });
+                                        const objUrl = URL.createObjectURL(blob);
+                                        console.log('[Image API] 从 b64_json 解码生成图片 URL');
+                                        return objUrl;
+                                    } catch (e) {
+                                        console.error('[Image API] b64_json 解码失败:', e);
+                                    }
+                                }
+                                return '';
+                            }).filter(Boolean);
                             if (imageUrls.length === 0) {
                                 console.error('[Image API] 响应数据:', data);
                                 throw new Error('No Image URL found in response');
@@ -14598,14 +14909,20 @@ You must design a visual composition that tells the story through **8 distinct p
                                                                 const currentModel = apiConfigsMap.get(node.settings?.model);
                                                                 const modelId = currentModel?.id || currentModel?.modelName || '';
                                                                 const modelName = currentModel?.modelName || '';
-                                                                // gpt-image-2 显示尺寸值（如 1024x1536）
+                                                                // gpt-image-2 显示当前尺寸值（如 "3840×2160" 或 "4K 16:9"）
                                                                 if (modelName.includes('gpt-image-2') || modelId.includes('gpt-image-2')) {
-                                                                    return node.settings?.resolution || '1024x1024';
+                                                                    // 向下兼容：如果存的是旧 sizeStr 格式，直接显示；否则从 ratio+tier 计算出 sizeStr
+                                                                    const curRes = node.settings?.resolution || '';
+                                                                    if (curRes && curRes.match(/^\d+x\d+$/)) return curRes; // 旧格式直接显示
+                                                                    const curTier = node.settings?.gptImageTier || GPT_IMAGE2_DEFAULT_TIER;
+                                                                    const curRatio = node.settings?.gptImageRatio || GPT_IMAGE2_DEFAULT_RATIO;
+                                                                    const sizeStr = GPT_IMAGE2_SIZE_MAP[curRatio]?.[curTier];
+                                                                    return sizeStr || `${curTier} ${curRatio}`;
                                                                 }
                                                                 const availableResolutions = getResolutionsForModel(modelId, modelName);
                                                                 const currentResolution = node.settings?.resolution || 'Auto';
-                                                                const displayResolution = availableResolutions.includes(currentResolution) 
-                                                                    ? currentResolution 
+                                                                const displayResolution = availableResolutions.includes(currentResolution)
+                                                                    ? currentResolution
                                                                     : (availableResolutions[0] || 'Auto');
                                                                 if (!availableResolutions.includes(currentResolution) && availableResolutions.length > 0) {
                                                                     setTimeout(() => {
@@ -14620,35 +14937,87 @@ You must design a visual composition that tells the story through **8 distinct p
                                                             const modelId = currentModel?.id || currentModel?.modelName || '';
                                                             const modelName = currentModel?.modelName || '';
                                                             const isGptImage2 = modelName.includes('gpt-image-2') || modelId.includes('gpt-image-2');
+                                                            // [修复3] gpt-image-2 使用档位(1K/2K/4K) + 比例 双选择器（与 Comfly 官方一致）
+                                                            if (isGptImage2) {
+                                                                const curTier = node.settings?.gptImageTier || GPT_IMAGE2_DEFAULT_TIER;
+                                                                const curRatio = node.settings?.gptImageRatio || GPT_IMAGE2_DEFAULT_RATIO;
+                                                                return (
+                                                                    <div
+                                                                        className="absolute bottom-full right-0 mb-1 w-52 rounded-lg shadow-xl z-[60] border overflow-hidden"
+                                                                        style={{ backgroundColor: theme === 'dark' ? '#18181b' : 'white', borderColor: theme === 'dark' ? '#3f3f46' : '#e4e4e7' }}
+                                                                        onMouseDown={e => e.stopPropagation()}
+                                                                    >
+                                                                        {/* 档位切换标签栏 */}
+                                                                        <div className="flex border-b" style={{ borderColor: theme === 'dark' ? '#27272a' : '#f4f4f5' }}>
+                                                                            {GPT_IMAGE2_TIERS.map(tier => (
+                                                                                <button
+                                                                                    key={tier}
+                                                                                    onClick={(e) => {
+                                                                                        e.stopPropagation();
+                                                                                        // 切换档位时，检查当前比例是否支持该档位
+                                                                                        const newSettings = { gptImageTier: tier };
+                                                                                        const currentSize = GPT_IMAGE2_SIZE_MAP[curRatio]?.[tier];
+                                                                                        if (currentSize) newSettings.resolution = currentSize;
+                                                                                        else {
+                                                                                            // 当前比例不支持该档位，自动切换到默认比例
+                                                                                            newSettings.gptImageRatio = GPT_IMAGE2_DEFAULT_RATIO;
+                                                                                            newSettings.resolution = GPT_IMAGE2_SIZE_MAP[GPT_IMAGE2_DEFAULT_RATIO][tier];
+                                                                                        }
+                                                                                        updateNodeSettings(node.id, newSettings);
+                                                                                    }}
+                                                                                    className={`flex-1 py-1.5 text-[11px] font-medium transition-colors ${curTier === tier
+                                                                                        ? (theme === 'dark' ? 'text-blue-400 bg-blue-900/20 border-b-2 border-blue-400' : 'text-blue-600 bg-blue-50 border-b-2 border-blue-500')
+                                                                                        : (theme === 'dark' ? 'text-zinc-400 hover:text-zinc-200' : 'text-zinc-500 hover:text-zinc-700')
+                                                                                    }`}
+                                                                                >
+                                                                                    {tier}
+                                                                                </button>
+                                                                            ))}
+                                                                        </div>
+                                                                        {/* 比例列表 */}
+                                                                        <div className="p-1 max-h-56 overflow-y-auto">
+                                                                            {GPT_IMAGE2_RATIOS.map(ratio => {
+                                                                                const sizeStr = GPT_IMAGE2_SIZE_MAP[ratio]?.[curTier];
+                                                                                const isDisabled = !sizeStr;
+                                                                                const isSelected = curRatio === ratio && curTier === (node.settings?.gptImageTier || GPT_IMAGE2_DEFAULT_TIER);
+                                                                                return (
+                                                                                    <button
+                                                                                        key={ratio}
+                                                                                        disabled={isDisabled}
+                                                                                        onClick={() => {
+                                                                                            if (isDisabled) return;
+                                                                                            updateNodeSettings(node.id, {
+                                                                                                gptImageRatio: ratio,
+                                                                                                gptImageTier: curTier,
+                                                                                                resolution: sizeStr,
+                                                                                            });
+                                                                                            setActiveDropdown(null);
+                                                                                        }}
+                                                                                        className={`w-full flex items-center justify-between px-2 py-1 text-left text-[10px] rounded transition-colors ${
+                                                                                            isDisabled
+                                                                                                ? 'opacity-30 cursor-not-allowed'
+                                                                                                : theme === 'dark' ? 'text-zinc-300 hover:bg-zinc-800' : 'text-zinc-700 hover:bg-zinc-100'
+                                                                                        } ${isSelected ? (theme === 'dark' ? 'bg-blue-900/30 text-blue-300' : 'bg-blue-50 text-blue-700') : ''}`}
+                                                                                    >
+                                                                                        <span>{ratio}</span>
+                                                                                        <span className="font-mono opacity-60">{sizeStr || '—'}</span>
+                                                                                    </button>
+                                                                                );
+                                                                            })}
+                                                                        </div>
+                                                                    </div>
+                                                                );
+                                                            }
                                                             return (
                                                                 <div
-                                                                    className={`absolute bottom-full right-0 mb-1 ${isGptImage2 ? 'w-36' : 'w-24'} rounded-lg shadow-xl p-1 z-[60] border ${
+                                                                    className={`absolute bottom-full right-0 mb-1 w-24 rounded-lg shadow-xl p-1 z-[60] border ${
                                                                         theme === 'dark'
                                                                             ? 'bg-[#18181b] border-zinc-700'
                                                                             : 'bg-white border-zinc-200'
                                                                     }`}
                                                                     onMouseDown={e => e.stopPropagation()}
                                                                 >
-                                                                    {isGptImage2 ? (
-                                                                        GPT_IMAGE2_SIZES.map(s => (
-                                                                            <button
-                                                                                key={s.value}
-                                                                                onClick={() => {
-                                                                                    updateNodeSettings(node.id, { resolution: s.value });
-                                                                                    setActiveDropdown(null);
-                                                                                }}
-                                                                                className={`w-full flex items-center justify-between px-2 py-1 text-left text-[10px] rounded ${
-                                                                                    theme === 'dark'
-                                                                                        ? 'text-zinc-300 hover:bg-zinc-800'
-                                                                                        : 'text-zinc-700 hover:bg-zinc-100'
-                                                                                } ${node.settings?.resolution === s.value ? (theme === 'dark' ? 'bg-blue-900/30 text-blue-300' : 'bg-blue-50 text-blue-700') : ''}`}
-                                                                            >
-                                                                                <span>{s.label}</span>
-                                                                                <span className="font-mono opacity-60">{s.value}</span>
-                                                                            </button>
-                                                                        ))
-                                                                    ) : (
-                                                                        getResolutionsForModel(modelId, modelName).map(r => (
+                                                                    {getResolutionsForModel(modelId, modelName).map(r => (
                                                                             <button
                                                                                 key={r}
                                                                                 onClick={() => {
@@ -14664,7 +15033,7 @@ You must design a visual composition that tells the story through **8 distinct p
                                                                                 {r}
                                                                             </button>
                                                                         ))
-                                                                    )}
+                                                                    }
                                                                 </div>
                                                             );
                                                         })()}
