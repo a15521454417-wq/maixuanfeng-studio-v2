@@ -804,6 +804,407 @@
         // RunningHub API 配置
         const RUNNINGHUB_BASE_URL = 'https://www.runninghub.cn';
 
+        // ===== RunningHub SDK（从 AI-CanvasPro 提取，IIFE 内联版）=====
+        const RH_SDK = (() => {
+            const BASE = RUNNINGHUB_BASE_URL;
+            const TASK_API = `${BASE}/task/openapi`;
+            const OPENAPI_V2 = `${BASE}/openapi/v2`;
+
+            const ENDPOINTS = {
+                workflowRun:     `${TASK_API}/create`,
+                workflowQuery:   `${TASK_API}/query`,
+                workflowCancel:  `${TASK_API}/cancel`,
+                aiAppRun:        (appId) => `${OPENAPI_V2}/run/ai-app/${appId}`,
+                openapiQuery:    `${OPENAPI_V2}/query`,
+                openapiCancel:   `${OPENAPI_V2}/cancel`,
+                uploadImage:     `${TASK_API}/upload/image`,
+                uploadVideo:     `${TASK_API}/upload/video`,
+                uploadMediaV2:   `${OPENAPI_V2}/media/upload/binary`,
+                workflowJson:    `${BASE}/api/comfyui/workflow/json`,
+            };
+
+            const STATUS_SUCCESS  = new Set(['COMPLETED', 'SUCCEEDED', 'SUCCESS']);
+            const STATUS_PENDING  = new Set(['SUBMITTED', 'PENDING', 'QUEUED', 'RUNNING', 'PROCESSING', '']);
+            const STATUS_FAILED   = new Set(['FAILED', 'FAIL', 'ERROR', 'CANCELLED']);
+            const PENDING_CODES   = new Set([804, 813]);
+
+            // 通用请求
+            async function request(url, body, { apiKey, timeout = 60000, retries = 2, retryDelay = 1000, signal } = {}) {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), timeout);
+                if (signal) {
+                    if (signal.aborted) { clearTimeout(timer); throw new Error('CANCELLED'); }
+                    signal.addEventListener('abort', () => controller.abort(), { once: true });
+                }
+                let lastError = null;
+                for (let attempt = 0; attempt <= retries; attempt++) {
+                    try {
+                        const res = await fetch(url, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {}),
+                            },
+                            body: JSON.stringify(body),
+                            signal: controller.signal,
+                        });
+                        clearTimeout(timer);
+                        if (signal) signal.removeEventListener('abort', () => controller.abort());
+                        if (!res.ok) {
+                            const errBody = await res.text().catch(() => '');
+                            throw new Error(`HTTP ${res.status}: ${errBody.slice(0, 200)}`);
+                        }
+                        return await res.json();
+                    } catch (err) {
+                        lastError = err;
+                        if (err.name === 'AbortError') throw new Error('请求超时或已取消');
+                        if (attempt < retries) await new Promise(r => setTimeout(r, retryDelay * (attempt + 1)));
+                    }
+                }
+                throw lastError;
+            }
+
+            // 运行工作流
+            async function runWorkflow({ apiKey, workflowId, nodeInfoList, instanceType = 'default', usePersonalQueue = false, signal }) {
+                const body = { apiKey, workflowId, addMetadata: false, nodeInfoList: nodeInfoList || [], instanceType, usePersonalQueue: String(usePersonalQueue) };
+                const result = await request(ENDPOINTS.workflowRun, body, { apiKey, signal });
+                if (result.code !== undefined && result.code !== 0) throw new Error(result.msg || result.error || `工作流运行失败 (code: ${result.code})`);
+                const taskId = result.data?.taskId || result.taskId || result.task_id;
+                if (!taskId) throw new Error('工作流提交成功但未返回 taskId');
+                return { taskId };
+            }
+
+            // 运行 AI App
+            async function runAiApp({ apiKey, appId, nodeInfoList, instanceType = 'default', usePersonalQueue = false, signal }) {
+                const apiUrl = ENDPOINTS.aiAppRun(appId);
+                const body = { apiKey, nodeInfoList: nodeInfoList || [], instanceType, usePersonalQueue: String(usePersonalQueue) };
+                const result = await request(ENDPOINTS.workflowRun, { apiUrl, apiKey, ...body }, { apiKey, signal });
+                const taskId = result.data?.taskId || result.taskId || result.task_id;
+                if (!taskId) throw new Error('AI App 提交成功但未返回 taskId');
+                return { taskId };
+            }
+
+            // 查询任务（工作流模式）
+            async function queryWorkflowTask({ apiKey, taskId, signal }) {
+                return await request(ENDPOINTS.workflowQuery, { apiKey, taskId }, { apiKey, timeout: 30000, signal });
+            }
+
+            // 查询任务（OpenAPI V2）
+            async function queryOpenapiTask({ apiKey, taskId, signal }) {
+                return await request(ENDPOINTS.openapiQuery, { apiKey, taskId }, { apiKey, timeout: 30000, signal });
+            }
+
+            // 轮询直到完成
+            async function pollUntilDone({ apiKey, taskId, useOpenapiQuery = false, pollInterval = 2000, maxPolls = 450, onProgress, signal }) {
+                if (!apiKey) throw new Error('RunningHub API Key 未配置');
+                if (!taskId) throw new Error('缺少 RunningHub 任务 ID');
+                for (let i = 0; i < maxPolls; i++) {
+                    if (signal?.aborted) throw new Error('CANCELLED');
+                    if (i > 0) await new Promise(r => setTimeout(r, pollInterval));
+                    if (signal?.aborted) throw new Error('CANCELLED');
+                    const queryFn = useOpenapiQuery ? queryOpenapiTask : queryWorkflowTask;
+                    const result = await queryFn({ apiKey, taskId, signal });
+                    if (!useOpenapiQuery) {
+                        const code = typeof result.code === 'number' ? result.code : null;
+                        if (code !== null && PENDING_CODES.has(code)) { onProgress?.('pending', result); continue; }
+                        if (code !== null && code !== 0) throw new Error(getErrorMessage(result) || `任务轮询失败 (code: ${code})`);
+                    }
+                    const status = normalizeStatus(result);
+                    if (STATUS_FAILED.has(status)) throw new Error(getErrorMessage(result) || '任务执行失败');
+                    if (STATUS_SUCCESS.has(status) || hasResult(result)) { onProgress?.('completed', result); return result; }
+                    if (STATUS_PENDING.has(status)) { onProgress?.('running', result); continue; }
+                    if (extractImageUrls(result).length > 0) { onProgress?.('completed', result); return result; }
+                    onProgress?.('polling', result);
+                }
+                throw new Error('任务超时，请稍后重试');
+            }
+
+            // 取消任务
+            async function cancelTask({ apiKey, taskId, signal }) {
+                const result = await request(ENDPOINTS.workflowCancel, { apiKey, taskId }, { apiKey, timeout: 180000, signal });
+                if (!result.success && result.code !== 0) throw new Error(result.msg || result.error || '取消失败');
+                return result.data || result;
+            }
+
+            // 上传图片（v1 API）
+            async function uploadImage({ image, apiKey, signal }) {
+                let blob;
+                if (image instanceof Blob || image instanceof File) { blob = image; }
+                else if (typeof image === 'string') { blob = base64ToBlob(image); }
+                else throw new Error('不支持的图片格式');
+                const formData = new FormData();
+                formData.append('image', blob, 'image.png');
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 120000);
+                if (signal) {
+                    if (signal.aborted) { clearTimeout(timer); throw new Error('CANCELLED'); }
+                    signal.addEventListener('abort', () => controller.abort(), { once: true });
+                }
+                try {
+                    const res = await fetch(ENDPOINTS.uploadImage, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${apiKey}` },
+                        body: formData,
+                        signal: controller.signal,
+                    });
+                    clearTimeout(timer);
+                    if (!res.ok) throw new Error(`图片上传失败 (${res.status})`);
+                    const data = await res.json();
+                    const imageUrl = data.data?.url || data.url || data.data?.imageUrl || '';
+                    if (!imageUrl) throw new Error('图片上传成功但未返回 URL');
+                    return imageUrl;
+                } finally {
+                    if (signal) signal.removeEventListener('abort', () => controller.abort());
+                }
+            }
+
+            // 上传图片（v2 API — 返回 { fileName, url }）
+            async function uploadMediaV2({ image, apiKey, signal }) {
+                let blob;
+                if (image instanceof Blob || image instanceof File) { blob = image; }
+                else if (typeof image === 'string') {
+                    if (image.startsWith('data:')) {
+                        const response = await fetch(image);
+                        blob = await response.blob();
+                    } else if (image.startsWith('http')) {
+                        const response = await fetch(image);
+                        blob = await response.blob();
+                    } else {
+                        blob = base64ToBlob(image);
+                    }
+                } else throw new Error('不支持的图片格式');
+                const mimeType = blob.type || 'image/png';
+                const extension = mimeType.split('/')[1] || 'png';
+                const fileName = `upload_${Date.now()}.${extension}`;
+                const formData = new FormData();
+                formData.append('file', blob, fileName);
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 120000);
+                if (signal) {
+                    if (signal.aborted) { clearTimeout(timer); throw new Error('CANCELLED'); }
+                    signal.addEventListener('abort', () => controller.abort(), { once: true });
+                }
+                try {
+                    const res = await fetch(ENDPOINTS.uploadMediaV2, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${apiKey}` },
+                        body: formData,
+                        signal: controller.signal,
+                    });
+                    clearTimeout(timer);
+                    if (!res.ok) throw new Error(`上传失败: HTTP ${res.status}`);
+                    const data = await res.json();
+                    if (data.code === 0 && data.data) {
+                        return {
+                            fileName: data.data.fileName,
+                            url: data.data.download_url || data.data.url || `${BASE}/${data.data.fileName}`
+                        };
+                    }
+                    throw new Error(data.msg || data.message || '上传失败');
+                } finally {
+                    if (signal) signal.removeEventListener('abort', () => controller.abort());
+                }
+            }
+
+            // 上传视频
+            async function uploadVideo(video, apiKey) {
+                const formData = new FormData();
+                formData.append('video', video instanceof File ? video : new File([video], 'video.mp4'));
+                const res = await fetch(ENDPOINTS.uploadVideo, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${apiKey}` },
+                    body: formData,
+                });
+                if (!res.ok) throw new Error(`视频上传失败 (${res.status})`);
+                const data = await res.json();
+                const videoUrl = data.data?.url || data.url || '';
+                if (!videoUrl) throw new Error('视频上传成功但未返回 URL');
+                return videoUrl;
+            }
+
+            // 一站式工作流生图
+            async function generateWithWorkflow({ apiKey, workflowId, nodeInfoList, pollOptions = {}, ...runOptions }) {
+                const { taskId } = await runWorkflow({ apiKey, workflowId, nodeInfoList, ...runOptions });
+                const result = await pollUntilDone({ apiKey, taskId, ...pollOptions });
+                return extractImageUrls(result);
+            }
+
+            // 一站式 AI App 生图
+            async function generateWithAiApp({ apiKey, appId, nodeInfoList, pollOptions = {}, ...runOptions }) {
+                const { taskId } = await runAiApp({ apiKey, appId, nodeInfoList, ...runOptions });
+                const result = await pollUntilDone({ apiKey, taskId, useOpenapiQuery: true, ...pollOptions });
+                return extractImageUrls(result);
+            }
+
+            // 模型 API 生图
+            async function generateWithModel({ apiKey, model, prompt, negativePrompt, aspectRatio = '1:1', imageSize = '2K', seed, inputImages = [], signal, onProgress }) {
+                if (!model) throw new Error('未指定模型');
+                const hasInputImages = inputImages.length > 0;
+                const TEXT_ONLY_MODELS = ['rhart-image-v1', 'rhart-image-v1-official', 'rhart-image-n-pro', 'rhart-image-n-pro-official'];
+                const IMAGE_REQUIRED_MODELS = ['rhart-image-n-g31-flash', 'rhart-image-n-g31-flash-official', 'seedream-v4', 'seedream-v4.5', 'seedream-v5-lite'];
+                let mode;
+                if (TEXT_ONLY_MODELS.includes(model)) mode = 'text-to-image';
+                else if (IMAGE_REQUIRED_MODELS.includes(model)) mode = 'image-to-image';
+                else mode = hasInputImages ? 'image-to-image' : 'text-to-image';
+                const apiUrl = hasInputImages ? `${OPENAPI_V2}/${model}/${mode}` : `${OPENAPI_V2}/${model}/text-to-image`;
+                const resolutionMap = { '1K': '1k', '2K': '2k', '3K': '3k', '4K': '4k' };
+                const resolution = resolutionMap[imageSize] || '2k';
+                const isSeedream = model.startsWith('seedream');
+                let dimensions = null;
+                if (isSeedream) dimensions = resolveModelDimensions(imageSize, aspectRatio);
+                const body = {
+                    prompt: prompt || '',
+                    ...(isSeedream ? { width: dimensions?.width || 2048, height: dimensions?.height || 2048 } : { resolution }),
+                    ...(!isAutoRatio(aspectRatio) && { aspectRatio }),
+                    ...(negativePrompt && { negativePrompt }),
+                    ...(seed !== undefined && seed !== null && { seed }),
+                    ...(hasInputImages && { imageUrls: inputImages }),
+                };
+                const submitResult = await request(ENDPOINTS.workflowRun, { apiUrl, apiKey, ...body }, { apiKey, timeout: 600000, signal });
+                const taskId = submitResult.data?.taskId || submitResult.taskId || extractTaskId(submitResult);
+                if (!taskId) {
+                    const urls = extractImageUrls(submitResult);
+                    if (urls.length > 0) return urls;
+                    throw new Error('模型 API 提交失败，未返回 taskId');
+                }
+                onProgress?.('submitted', { taskId });
+                const result = await pollUntilDone({ apiKey, taskId, useOpenapiQuery: true, onProgress: (status, data) => onProgress?.(status, data), signal });
+                return extractImageUrls(result);
+            }
+
+            // 获取工作流 JSON
+            async function getWorkflowJson({ apiKey, workflowId, signal }) {
+                const res = await fetch(ENDPOINTS.workflowJson, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ workflowId }),
+                    signal,
+                });
+                if (!res.ok) throw new Error(`获取工作流配置失败: HTTP ${res.status}`);
+                const data = await res.json();
+                if (data.code === 0) return data.data;
+                throw new Error(data.msg || data.message || '获取工作流配置失败');
+            }
+
+            // 自动发现节点映射
+            function discoverWorkflowNodes(workflowJson) {
+                const imageNodes = [], videoNodes = [], textNodes = [], paramNodes = [];
+                const IMAGE_NODE_TYPES = ['LoadImage', 'LoadImageBHB', 'LoadImagesFromFolder'];
+                const VIDEO_NODE_TYPES = ['LoadVideo', 'LoadVideoPath', 'LoadVideoNode'];
+                const TEXT_NODE_TYPES = ['CLIPTextEncode', 'TextEncode'];
+                if (!workflowJson || typeof workflowJson !== 'object') return { imageNodes, videoNodes, textNodes, paramNodes };
+                for (const [nodeId, nodeConfig] of Object.entries(workflowJson)) {
+                    if (!nodeConfig || !nodeConfig.class_type) continue;
+                    const classType = nodeConfig.class_type;
+                    const inputs = nodeConfig.inputs || {};
+                    if (IMAGE_NODE_TYPES.includes(classType) && 'image' in inputs) imageNodes.push({ nodeId, fieldName: 'image', classType });
+                    if (VIDEO_NODE_TYPES.includes(classType)) {
+                        const videoField = inputs.video ? 'video' : inputs.video_path ? 'video_path' : null;
+                        if (videoField) videoNodes.push({ nodeId, fieldName: videoField, classType });
+                    }
+                    if (TEXT_NODE_TYPES.includes(classType) && 'text' in inputs) textNodes.push({ nodeId, fieldName: 'text', classType });
+                    const paramFields = ['resolution', 'width', 'height', 'seed', 'steps', 'cfg', 'denoise', 'sampler_name'];
+                    for (const field of paramFields) {
+                        if (field in inputs) { paramNodes.push({ nodeId, fieldName: field, classType, currentValue: inputs[field] }); break; }
+                    }
+                }
+                return { imageNodes, videoNodes, textNodes, paramNodes };
+            }
+
+            // ===== 工具函数 =====
+            function normalizeStatus(data) {
+                const inner = data?.data && typeof data.data === 'object' && !Array.isArray(data.data) ? data.data : data;
+                return String(inner?.status || data?.status || inner?.taskStatus || '').trim().toUpperCase();
+            }
+            function getErrorMessage(data) {
+                const inner = data?.data && typeof data.data === 'object' && !Array.isArray(data.data) ? data.data : data;
+                return String(inner?.errorMessage || inner?.msg || inner?.error || inner?.failure_reason || '').trim();
+            }
+            function hasResult(data) {
+                if (Array.isArray(data?.data) && data.data.length > 0) return true;
+                const inner = data?.data && typeof data.data === 'object' && !Array.isArray(data.data) ? data.data : data;
+                if (Array.isArray(inner?.results) && inner.results.length > 0) return true;
+                return !!(inner?.url || inner?.imageUrl || inner?.fileUrl || inner?.videoUrl || inner?.download_url);
+            }
+            function extractImageUrls(data) {
+                const urls = [];
+                if (data?.data?.images && Array.isArray(data.data.images)) urls.push(...data.data.images.map(img => Array.isArray(img.url) ? img.url[0] : img.url));
+                else if (data?.status === 'succeeded' && data?.results) urls.push(...data.results.map(r => r.url));
+                else if (data?.data?.[0]?.url) urls.push(...data.data.map(d => d.url));
+                else if (data?.data?.[0]?.fileUrl) urls.push(...data.data.map(d => d.fileUrl));
+                else if (data?.data?.results) urls.push(...data.data.results.map(r => r.url));
+                else if (data?.data?.[0]?.download_url) urls.push(...data.data.map(d => d.download_url));
+                else if (Array.isArray(data?.images)) urls.push(...data.images.map(img => typeof img === 'string' ? img : img.url || img.imageUrl));
+                else if (Array.isArray(data?.results)) urls.push(...data.results.map(r => r.url || r.imageUrl || r.image_url || r.videoUrl || r.download_url));
+                else { const singleUrl = data?.url || data?.imageUrl || data?.fileUrl || data?.file_url || data?.image || data?.videoUrl || data?.download_url; if (singleUrl) urls.push(singleUrl); }
+                return urls.filter(Boolean);
+            }
+            function extractTaskId(data) {
+                const candidates = [data?.data?.taskId, data?.data?.task_id, data?.data?.id, data?.taskId, data?.task_id, data?.id, data?.result?.taskId, data?.result?.task_id, data?.result?.id];
+                for (const c of candidates) { const s = String(c || '').trim(); if (s && s.length >= 8 && /^[a-zA-Z0-9._:-]+$/.test(s)) return s; }
+                return '';
+            }
+            function isAutoRatio(ratio) { const r = String(ratio || '').toLowerCase(); return !r || r === 'auto' || r === '自适应' || r === 'default' || r === 'original' || r === '默认' || r === '原图比例'; }
+            function resolveModelDimensions(quality = '2K', ratio = '1:1') {
+                const QUALITY_PIXELS = { '1K': 1024*1024, '2K': 2048*2048, '3K': 2560*2560, '4K': 2880*2880 };
+                const VALID_RATIOS = ['1:1','3:4','4:3','2:3','3:2','9:16','16:9','4:5','5:4','21:9'];
+                const RATIO_SET = new Set(VALID_RATIOS);
+                const q = String(quality || '2K').toUpperCase();
+                const pixels = QUALITY_PIXELS[q] || QUALITY_PIXELS['2K'];
+                let r = String(ratio || '1:1').replace(/[：：]/g, ':').replace(/\s+/g, '');
+                if (isAutoRatio(r)) r = '1:1';
+                if (!r.includes(':')) r = '1:1';
+                const [wStr, hStr] = r.split(':');
+                const wR = Number.parseFloat(wStr) || 1, hR = Number.parseFloat(hStr) || 1;
+                let finalRatio = `${wR}:${hR}`;
+                if (!RATIO_SET.has(finalRatio)) {
+                    const targetRatio = wR / hR; let bestMatch = VALID_RATIOS[0], minDiff = Infinity;
+                    for (const vr of VALID_RATIOS) { const [vw, vh] = vr.split(':').map(Number); const diff = Math.abs(targetRatio - vw / vh); if (diff < minDiff) { minDiff = diff; bestMatch = vr; } }
+                    finalRatio = bestMatch;
+                }
+                const [bw, bh] = finalRatio.split(':').map(Number);
+                const h = Math.sqrt(pixels / (bw / bh));
+                const w = h * (bw / bh);
+                const align = (v) => { const a = Math.round(Number(v||0)/8)*8; return Math.max(512, Math.min(8192, a)); };
+                return { width: align(w), height: align(h) };
+            }
+            function base64ToBlob(base64) {
+                const raw = base64.includes(',') ? base64.split(',')[1] : base64;
+                const mime = base64.match(/data:([^;]+)/)?.[1] || 'image/png';
+                const binary = atob(raw);
+                const arr = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) arr[i] = binary.charCodeAt(i);
+                return new Blob([arr], { type: mime });
+            }
+
+            // 预置工作流 ID
+            const WORKFLOW_IDS = {
+                IMAGE_EDIT: '1078', IMAGE_REPLACE: '2041177685895946242', IMAGE_REPLACE_V2: '2037339851183366146',
+                VIDEO_EDIT: '2041741496667348994', VIDEO_STYLE: '1077', VIDEO_MATTING: 'video_matting', VIDEO_LIPSYNC: '1185',
+            };
+
+            // 预置模型 ID
+            const MODEL_IDS = {
+                NANO_BANANA_LOW: 'runninghub-model/nano-banana', NANO_BANANA_2: 'runninghub-model/nano-banana-2',
+                NANO_BANANA_PRO: 'runninghub-model/nano-banana-pro', IMAGE_V1: 'runninghub-model/rhart-image-v1',
+                IMAGE_V1_OFF: 'runninghub-model/rhart-image-v1-official', IMAGE_N_PRO: 'runninghub-model/rhart-image-n-pro',
+                IMAGE_N_PRO_OFF: 'runninghub-model/rhart-image-n-pro-official', IMAGE_N_G31: 'runninghub-model/rhart-image-n-g31-flash',
+                IMAGE_N_G31_OFF: 'runninghub-model/rhart-image-n-g31-flash-official',
+                SEEDREAM_V4: 'runninghub-model/seedream-v4', SEEDREAM_V45: 'runninghub-model/seedream-v4.5',
+                SEEDREAM_V5_LITE: 'runninghub-model/seedream-v5-lite',
+            };
+
+            return {
+                runWorkflow, runAiApp, queryWorkflowTask, queryOpenapiTask,
+                pollUntilDone, cancelTask, uploadImage, uploadMediaV2, uploadVideo,
+                generateWithWorkflow, generateWithAiApp, generateWithModel,
+                getWorkflowJson, discoverWorkflowNodes,
+                extractImageUrls, resolveModelDimensions, base64ToBlob,
+                ENDPOINTS, WORKFLOW_IDS, MODEL_IDS,
+                STATUS_SUCCESS, STATUS_PENDING, STATUS_FAILED,
+            };
+        })();
+
         // GRS AI Nano Banana 模型列表
         const GRS_NANO_MODELS = {
             'nano-banana-fast':      { label: 'Nano Fast',      quality: ['1K'],           speed: '⚡最快' },
@@ -841,11 +1242,14 @@
             { id: 'jimeng-3.1', provider: 'Jimeng 3.1', modelName: 'jimeng-3.1', type: 'Image', key: '', url: JIMENG_API_BASE_URL },
             
             // Video Models
-
+            { id: 'seedance-2', provider: 'Seedance 2.0', modelName: 'doubao-seedance-2-0-260128', type: 'Video', key: '', url: DEFAULT_BASE_URL, isSeedance: true },
+            { id: 'seedance-2-fast', provider: 'Seedance 2.0 Fast', modelName: 'doubao-seedance-2-0-fast-260128', type: 'Video', key: '', url: DEFAULT_BASE_URL, isSeedance: true },
 
             // RunningHub 工作流（图片 / 视频分开配置）
             { id: 'runninghub-image', provider: 'RunningHub 绘图工作流', modelName: 'workflow', type: 'Image', key: '', url: RUNNINGHUB_BASE_URL, isRunningHub: true },
             { id: 'runninghub-video', provider: 'RunningHub 视频工作流', modelName: 'workflow', type: 'Video', key: '', url: RUNNINGHUB_BASE_URL, isRunningHub: true },
+            // RunningHub 模型 API（直接调用模型，无需工作流 ID）
+            { id: 'runninghub-model', provider: 'RunningHub 模型 API', modelName: 'seedream-v4.5', type: 'Image', key: '', url: RUNNINGHUB_BASE_URL, isRunningHub: true, isRhModel: true },
         ];
 
         const RATIOS = ['Auto', '1:1', '16:9', '9:16', '4:3', '3:4', '21:9', '3:2', '2:3'];
@@ -942,7 +1346,14 @@ You must design a visual composition that tells the story through **8 distinct p
             'jimeng', // Jimeng Video
             'hailuo-02',
             'kling-v1-6',
-            'wan-2.5'
+            'wan-2.5',
+            // 不需要的视频模型（仅保留 RunningHub 视频工作流）
+            'sora-2',
+            'sora-2-pro',
+            'grok-video-3',
+            'veo-3',
+            'veo-3.1',
+            'minimax-video',
         ];
 
         const getRatiosForModel = (modelId) => {
@@ -952,25 +1363,26 @@ You must design a visual composition that tells the story through **8 distinct p
         };
         const RESOLUTIONS = ['Auto', '1K', '2K', '4K'];
         // 根据模型返回不同的分辨率选项
-        // gpt-image-2 支持的精确分辨率列表（像素预算≤8,294,400，16px倍数）
+        // gpt-image-2 支持的精确分辨率列表（像素预算≤8,294,400）
         // gpt-image-2 分辨率档位：1K / 2K / 4K（与 Comfly 官方 nodes_openai.py 一致）
+        // 更新于 2026-04-27：同步 Comfly commit af51551，全部 12 种比例均支持 4K，1K/2K 像素值已校准
         const GPT_IMAGE2_TIERS = ['1K', '2K', '4K'];
-        // gpt-image-2 完整 13 种比例尺寸表（与 Comfly 官方一致，像素预算≤8,294,400）
+        // gpt-image-2 完整 12 种比例尺寸表（与 Comfly 官方 commit af51551 一致，像素预算≤8,294,400）
         const GPT_IMAGE2_SIZE_MAP = {
             // 比例 → { '1K': sizeStr, '2K': sizeStr, '4K': sizeStr }
-            '1:1':    { '1K': '1024x1024',   '2K': '2048x2048',   '4K': null },           // 4K 超限
-            '16:9':   { '1K': '1536x864',    '2K': '2048x1152',   '4K': '3840x2160' },
-            '9:16':   { '1K': '864x1536',    '2K': '1152x2048',   '4K': '2160x3840' },
-            '3:2':    { '1K': '1536x1024',   '2K': '2048x1360',   '4K': null },
-            '2:3':    { '1K': '1024x1536',   '2K': '1360x2048',   '4K': null },
-            '4:3':    { '1K': '1024x768',    '2K': '2048x1536',   '4K': null },
-            '3:4':    { '1K': '768x1024',    '2K': '1536x2048',   '4K': null },
-            '5:4':    { '1K': '1280x1024',   '2K': '2560x2048',   '4K': null },
-            '4:5':    { '1K': '1024x1280',   '2K': '2048x2560',   '4K': null },
+            '1:1':    { '1K': '1024x1024',   '2K': '2048x2048',   '4K': '2880x2880' },
+            '16:9':   { '1K': '1280x720',    '2K': '2560x1440',   '4K': '3840x2160' },
+            '9:16':   { '1K': '720x1280',    '2K': '1440x2560',   '4K': '2160x3840' },
+            '3:2':    { '1K': '1248x832',    '2K': '2496x1664',   '4K': '3504x2336' },
+            '2:3':    { '1K': '832x1248',    '2K': '1664x2496',   '4K': '2336x3504' },
+            '4:3':    { '1K': '1152x864',    '2K': '2304x1728',   '4K': '3264x2448' },
+            '3:4':    { '1K': '864x1152',    '2K': '1728x2304',   '4K': '2448x3264' },
+            '5:4':    { '1K': '1120x896',    '2K': '2240x1792',   '4K': '3200x2560' },
+            '4:5':    { '1K': '896x1120',    '2K': '1792x2240',   '4K': '2560x3200' },
             '2:1':    { '1K': '2048x1024',   '2K': '2688x1344',   '4K': '3840x1920' },
             '1:2':    { '1K': '1024x2048',   '2K': '1344x2688',   '4K': '1920x3840' },
-            '21:9':   { '1K': '2016x864',    '2K': '2688x1152',   '4K': '3840x1648' },
-            '9:21':   { '1K': '864x2016',    '2K': '1152x2688',   '4K': '1648x3840' },
+            '21:9':   { '1K': '1456x624',    '2K': '3024x1296',   '4K': '3696x1584' },
+            '9:21':   { '1K': '624x1456',    '2K': '1296x3024',   '4K': '1584x3696' },
         };
         const GPT_IMAGE2_RATIOS = Object.keys(GPT_IMAGE2_SIZE_MAP);
         // 默认选中的比例和档位
@@ -1060,7 +1472,7 @@ You must design a visual composition that tells the story through **8 distinct p
                     useTier = parsed.tier;
                 }
                 const sizeStr = GPT_IMAGE2_SIZE_MAP[useRatio]?.[useTier] || GPT_IMAGE2_SIZE_MAP[GPT_IMAGE2_DEFAULT_RATIO][useTier];
-                if (!sizeStr) { /* 该比例不支持该档位，fallback 到默认 */ }
+                if (!sizeStr) { /* fallback 到默认比例+档位（更新后所有比例均支持 4K，理论上不会触发） */ }
                 const [w, h] = (sizeStr || '1024x1024').split('x').map(Number);
                 return { sizeStr, w, h };
             }
@@ -2115,6 +2527,15 @@ You must design a visual composition that tells the story through **8 distinct p
                 // 过滤掉已删除的模型配置
                 configs = configs.filter(c => !DELETED_MODEL_IDS.includes(c.id));
                 
+                // ★ 合并：将 DEFAULT_API_CONFIGS 中新增的模型添加到用户配置中
+                const existingIds = new Set(configs.map(c => c.id));
+                for (const defaultConfig of DEFAULT_API_CONFIGS) {
+                    if (!existingIds.has(defaultConfig.id)) {
+                        console.log(`[Config Merge] 新增模型: ${defaultConfig.provider} (${defaultConfig.id})`);
+                        configs.push({ ...defaultConfig });
+                    }
+                }
+                
                 // 从localStorage读取保存的Session ID
                 // 第一次打开时如果没有保存的Session ID，使用空字符串（需要用户输入）
                 // 如果有保存的Session ID，则使用保存的值
@@ -2154,6 +2575,24 @@ You must design a visual composition that tells the story through **8 distinct p
                     );
                 }
                 
+                // 确保 RunningHub 配置项存在（如果不存在则添加）
+                const hasRhImage = configs.some(c => c.id === 'runninghub-image');
+                const hasRhVideo = configs.some(c => c.id === 'runninghub-video');
+                const hasRhModel = configs.some(c => c.id === 'runninghub-model');
+                if (!hasRhImage || !hasRhVideo || !hasRhModel) {
+                    // 找到插入位置（在最后一个配置之后）
+                    const insertIdx = configs.length;
+                    if (!hasRhImage) {
+                        configs.splice(insertIdx, 0, { id: 'runninghub-image', provider: 'RunningHub 绘图工作流', modelName: 'workflow', type: 'Image', key: '', url: RUNNINGHUB_BASE_URL, isRunningHub: true });
+                    }
+                    if (!hasRhVideo) {
+                        configs.splice(insertIdx + 1, 0, { id: 'runninghub-video', provider: 'RunningHub 视频工作流', modelName: 'workflow', type: 'Video', key: '', url: RUNNINGHUB_BASE_URL, isRunningHub: true });
+                    }
+                    if (!hasRhModel) {
+                        configs.splice(insertIdx + 2, 0, { id: 'runninghub-model', provider: 'RunningHub 模型 API', modelName: 'seedream-v4.5', type: 'Image', key: '', url: RUNNINGHUB_BASE_URL, isRunningHub: true, isRhModel: true });
+                    }
+                }
+                
                 // 立即保存迁移后的配置到 localStorage
                 try { localStorage.setItem('tapnow_api_configs', JSON.stringify(configs)); } catch (e) {}
                 return configs;
@@ -2179,6 +2618,7 @@ You must design a visual composition that tells the story through **8 distinct p
             const [runninghubApiKey, setRunninghubApiKey] = useState(() => localStorage.getItem('tapnow_runninghub_api_key') || '');
             const [runninghubWorkflowId, setRunninghubWorkflowId] = useState(() => localStorage.getItem('tapnow_runninghub_workflow_id') || '');
             const [runninghubWebhook, setRunninghubWebhook] = useState(() => localStorage.getItem('tapnow_runninghub_webhook') || '');
+            const [runninghubModelId, setRunninghubModelId] = useState(() => localStorage.getItem('tapnow_runninghub_model_id') || 'seedream-v4.5');
 
             // 保存 RunningHub 配置到 localStorage
             useEffect(() => {
@@ -2190,6 +2630,9 @@ You must design a visual composition that tells the story through **8 distinct p
             useEffect(() => {
                 localStorage.setItem('tapnow_runninghub_webhook', runninghubWebhook);
             }, [runninghubWebhook]);
+            useEffect(() => {
+                localStorage.setItem('tapnow_runninghub_model_id', runninghubModelId);
+            }, [runninghubModelId]);
 
             // 项目名称状态
             const [projectName, setProjectName] = useState(() => {
@@ -3796,7 +4239,7 @@ You must design a visual composition that tells the story through **8 distinct p
                 setApiTesting(id);
                 setApiStatus((prev) => ({ ...prev, [id]: 'idle' }));
                 const config = apiConfigsMap.get(id);
-                const apiKey = config?.key || globalApiKey;
+                const apiKey = globalApiKey || config?.key;
 
                 if (!apiKey) {
                     setApiStatus((prev) => ({ ...prev, [id]: 'error' }));
@@ -3920,7 +4363,7 @@ You must design a visual composition that tells the story through **8 distinct p
                 if ((!chatInput.trim() && chatFiles.length === 0) || isChatSending) return;
 
                 const config = apiConfigsMap.get(chatModel);
-                const apiKey = config?.key || globalApiKey;
+                const apiKey = globalApiKey || config?.key;
                 const baseUrl = (config?.url || DEFAULT_BASE_URL).replace(/\/+$/, '');
 
                 if (!apiKey) {
@@ -4154,6 +4597,36 @@ You must design a visual composition that tells the story through **8 distinct p
                             else reject(new Error('Canvas toBlob failed'));
                         }, 'image/png');
                         console.log(`[gpt-image-2] 参考图缩放: ${origW}x${origH} → ${newW}x${newH}`);
+                    };
+                    img.onerror = () => reject(new Error(`Failed to load image: ${imageUrl}`));
+                    img.src = imageUrl;
+                });
+            };
+
+            // gpt-image-2 输入图缩放 + 转 base64 data URI（用于 JSON 格式的 generations 端点）
+            // 与 Comfly_gpt_image_2 类的 image_to_base64_data_uri() 一致
+            const downscaleImageToDataUri = async (imageUrl, maxPixels = 1572864) => {
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.crossOrigin = 'anonymous';
+                    img.onload = () => {
+                        const origW = img.width;
+                        const origH = img.height;
+                        const origPixels = origW * origH;
+                        const canvas = document.createElement('canvas');
+                        if (origPixels <= maxPixels) {
+                            canvas.width = origW;
+                            canvas.height = origH;
+                        } else {
+                            const scale = Math.sqrt(maxPixels / origPixels);
+                            canvas.width = Math.round(origW * scale);
+                            canvas.height = Math.round(origH * scale);
+                            console.log(`[gpt-image-2] 参考图缩放: ${origW}x${origH} → ${canvas.width}x${canvas.height}`);
+                        }
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                        const dataUri = canvas.toDataURL('image/png');
+                        resolve(dataUri);
                     };
                     img.onerror = () => reject(new Error(`Failed to load image: ${imageUrl}`));
                     img.src = imageUrl;
@@ -5398,250 +5871,96 @@ You must design a visual composition that tells the story through **8 distinct p
                 });
             };
 
-            // ===== RunningHub 工作流轮询函数（v2 API）=====
-            const pollRunningHubJob = async (taskId, workflowId, nodeInfoList, sourceNodeId, w, h, attempt = 0, isVideoWorkflow = false) => {
-                const maxAttempts = 180; // 最多轮询180次（约15分钟，假设每次5秒）
-                const delayMs = 5000;
-
-                if (attempt > maxAttempts) {
-                    setHistory((prev) => prev.map((hItem) =>
-                        hItem.id === taskId
-                            ? { ...hItem, status: 'failed', errorMsg: 'RunningHub 工作流轮询超时' }
-                            : hItem
-                    ));
-                    return;
-                }
-
-                // RunningHub v2 API 查询接口：POST /openapi/v2/query
+            // ===== RunningHub SDK 调用封装 =====
+            // pollRunningHubJob — 使用 SDK 轮询任务
+            const pollRunningHubJob = async (taskId, workflowId, nodeInfoList, sourceNodeId, w, h, isVideoWorkflow = false) => {
                 try {
-                    const resp = await fetch(`${RUNNINGHUB_BASE_URL}/openapi/v2/query`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${runninghubApiKey}`
-                        },
-                        body: JSON.stringify({ taskId })
-                    });
-
-                    if (!resp.ok) {
-                        throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
-                    }
-
-                    const data = await resp.json();
-                    console.log('[Tapnow] RunningHub v2 Poll:', JSON.stringify(data, null, 2));
-
-                    // v2 API 返回格式：{ taskId, status, results: [{ url, nodeId, outputType }], errorCode, errorMessage }
-                    const status = data.status;
-                    const results = data.results || [];
-
-                    // 成功状态
-                    if (status === 'SUCCESS') {
-                        // 从 results 数组中提取第一个有效 URL
-                        let outputUrl = '';
-                        let outputType = '';
-
-                        for (const result of results) {
-                            if (result.url && (result.url.startsWith('http') || result.url.startsWith('data:'))) {
-                                outputUrl = result.url;
-                                outputType = result.outputType || '';
-                                break;
+                    const result = await RH_SDK.pollUntilDone({
+                        apiKey: runninghubApiKey,
+                        taskId,
+                        useOpenapiQuery: true,
+                        pollInterval: 5000,
+                        maxPolls: 180,
+                        onProgress: (status, data) => {
+                            if (status === 'completed') {
+                                const urls = RH_SDK.extractImageUrls(data);
+                                if (urls.length > 0) {
+                                    const outputUrl = urls[0];
+                                    const endTime = Date.now();
+                                    const historyItem = historyMap.get(taskId);
+                                    const startTime = historyItem?.startTime || endTime;
+                                    const durationMs = endTime - startTime;
+                                    const isVideo = isVideoWorkflow || outputUrl.includes('.mp4') || outputUrl.includes('.webm') || outputUrl.includes('.mov') || outputUrl.includes('video');
+                                    setHistory((prev) => {
+                                        const updated = prev.map((hItem) =>
+                                            hItem.id === taskId
+                                                ? { ...hItem, status: 'completed', progress: 100, url: outputUrl, type: isVideo ? 'video' : hItem.type, width: w, height: h, durationMs }
+                                                : hItem
+                                        );
+                                        const updatedItem = updated.find(h => h.id === taskId);
+                                        if (updatedItem?.sourceNodeId) {
+                                            setTimeout(() => { updatePreviewFromTask(taskId, outputUrl, isVideo ? 'video' : 'image', updatedItem.sourceNodeId); }, 0);
+                                        }
+                                        return updated;
+                                    });
+                                } else {
+                                    setHistory((prev) => prev.map((hItem) => hItem.id === taskId ? { ...hItem, status: 'completed', progress: 100, errorMsg: '任务完成但未返回输出URL' } : hItem));
+                                }
+                            } else {
+                                const progress = Math.min(95, 10 + (data ? 0.5 : 0));
+                                const statusText = status === 'pending' ? '排队中' : '运行中';
+                                setHistory((prev) => prev.map((hItem) => hItem.id === taskId ? { ...hItem, status: 'generating', progress, errorMsg: statusText } : hItem));
                             }
                         }
-
-                        // 如果找到输出URL，更新历史记录
-                        if (outputUrl) {
-                            const endTime = Date.now();
-                            const historyItem = historyMap.get(taskId);
-                            const startTime = historyItem?.startTime || endTime;
-                            const durationMs = endTime - startTime;
-
-                            // 判断输出类型：视频工作流强制标记，或通过 URL/outputType 识别
-                            const isVideo = isVideoWorkflow ||
-                                          outputUrl.includes('.mp4') || outputUrl.includes('.webm') ||
-                                          outputUrl.includes('.mov') || outputUrl.includes('video') ||
-                                          outputType === 'mp4' || outputType === 'webm';
-
-                            setHistory((prev) => {
-                                const updated = prev.map((hItem) =>
-                                    hItem.id === taskId
-                                        ? {
-                                            ...hItem,
-                                            status: 'completed',
-                                            progress: 100,
-                                            url: outputUrl,
-                                            type: isVideo ? 'video' : hItem.type,
-                                            width: w,
-                                            height: h,
-                                            durationMs
-                                        }
-                                        : hItem
-                                );
-
-                                // 更新预览窗口
-                                const updatedItem = updated.find(h => h.id === taskId);
-                                if (updatedItem?.sourceNodeId) {
-                                    setTimeout(() => {
-                                        updatePreviewFromTask(taskId, outputUrl, isVideo ? 'video' : 'image', updatedItem.sourceNodeId);
-                                    }, 0);
-                                }
-
-                                return updated;
-                            });
-                        } else {
-                            console.warn('[Tapnow] RunningHub v2: 任务成功但未找到输出URL', results);
-                            setHistory((prev) => prev.map((hItem) =>
-                                hItem.id === taskId
-                                    ? { ...hItem, status: 'completed', progress: 100, errorMsg: '任务完成但未返回输出URL' }
-                                    : hItem
-                            ));
-                        }
-                        return;
-                    }
-
-                    // 失败状态
-                    if (status === 'FAILED') {
-                        const errorMsg = data.errorMessage || data.failedReason?.exception_message || '任务失败';
-                        setHistory((prev) => prev.map((hItem) =>
-                            hItem.id === taskId
-                                ? { ...hItem, status: 'failed', errorMsg }
-                                : hItem
-                        ));
-                        return;
-                    }
-
-                    // 进行中状态 (RUNNING, QUEUED) - 继续轮询
-                    const progress = Math.min(95, 10 + (attempt * 0.5));
-                    const statusText = status === 'QUEUED' ? '排队中' : '运行中';
-                    setHistory((prev) => prev.map((hItem) =>
-                        hItem.id === taskId
-                            ? { ...hItem, status: 'generating', progress, errorMsg: statusText }
-                            : hItem
-                    ));
-
-                    setTimeout(() => pollRunningHubJob(taskId, workflowId, nodeInfoList, sourceNodeId, w, h, attempt + 1, isVideoWorkflow), delayMs);
-                } catch (err) {
-                    console.error('[Tapnow] RunningHub v2 Poll Error:', err);
-                    // 网络错误，继续重试
-                    if (attempt < maxAttempts - 5) {
-                        setTimeout(() => pollRunningHubJob(taskId, workflowId, nodeInfoList, sourceNodeId, w, h, attempt + 1, isVideoWorkflow), delayMs);
-                    } else {
-                        setHistory((prev) => prev.map((hItem) =>
-                            hItem.id === taskId
-                                ? { ...hItem, status: 'failed', errorMsg: `轮询失败: ${err.message || '网络错误'}` }
-                                : hItem
-                        ));
-                    }
-                }
-            };
-
-            // ===== RunningHub 文件上传函数（v2 API）=====
-            const uploadToRunningHub = async (imageData) => {
-                try {
-                    let blob;
-                    if (imageData.startsWith('data:')) {
-                        // Data URL 转换为 Blob
-                        const response = await fetch(imageData);
-                        blob = await response.blob();
-                    } else if (imageData.startsWith('http') || imageData.startsWith('https')) {
-                        // URL 下载后上传
-                        const response = await fetch(imageData);
-                        blob = await response.blob();
-                    } else {
-                        throw new Error('不支持的图片数据格式');
-                    }
-
-                    // RunningHub v2 API 上传接口：POST /openapi/v2/media/upload/binary
-                    // 需要直接传文件二进制，用 FormData 格式
-                    const formData = new FormData();
-                    // 根据blob类型生成文件名
-                    const mimeType = blob.type || 'image/png';
-                    const extension = mimeType.split('/')[1] || 'png';
-                    const fileName = `upload_${Date.now()}.${extension}`;
-                    formData.append('file', blob, fileName);
-
-                    const resp = await fetch(`${RUNNINGHUB_BASE_URL}/openapi/v2/media/upload/binary`, {
-                        method: 'POST',
-                        headers: {
-                            'Authorization': `Bearer ${runninghubApiKey}`
-                            // 注意：不设置 Content-Type，让浏览器自动设置 multipart/form-data
-                        },
-                        body: formData
                     });
-
-                    if (!resp.ok) {
-                        throw new Error(`上传失败: HTTP ${resp.status}`);
-                    }
-
-                    const data = await resp.json();
-                    console.log('[Tapnow] RunningHub v2 Upload:', data);
-
-                    // v2 API 返回格式：{ code: 0, message: 'success', data: { fileName: 'openapi/xxx.png', download_url: '...' } }
-                    if (data.code === 0 && data.data) {
-                        // 返回文件名（v2 API nodeInfoList 只需要文件名，不需要完整 URL）
-                        return {
-                            fileName: data.data.fileName,
-                            url: data.data.download_url || data.data.url || `https://www.runninghub.cn/${data.data.fileName}`
-                        };
-                    } else {
-                        throw new Error(data.msg || data.message || '上传失败');
+                    // 如果 pollUntilDone 返回了结果但 onProgress 的 completed 分支没被触发（兜底）
+                    const urls = RH_SDK.extractImageUrls(result);
+                    if (urls.length > 0) {
+                        const outputUrl = urls[0];
+                        const endTime = Date.now();
+                        const historyItem = historyMap.get(taskId);
+                        const startTime = historyItem?.startTime || endTime;
+                        const durationMs = endTime - startTime;
+                        const isVideo = isVideoWorkflow || outputUrl.includes('.mp4') || outputUrl.includes('.webm') || outputUrl.includes('.mov');
+                        setHistory((prev) => {
+                            const existing = prev.find(h => h.id === taskId);
+                            if (existing?.status === 'completed') return prev; // 已处理过
+                            const updated = prev.map((hItem) => hItem.id === taskId ? { ...hItem, status: 'completed', progress: 100, url: outputUrl, type: isVideo ? 'video' : hItem.type, width: w, height: h, durationMs } : hItem);
+                            const updatedItem = updated.find(h => h.id === taskId);
+                            if (updatedItem?.sourceNodeId) { setTimeout(() => { updatePreviewFromTask(taskId, outputUrl, isVideo ? 'video' : 'image', updatedItem.sourceNodeId); }, 0); }
+                            return updated;
+                        });
                     }
                 } catch (err) {
-                    console.error('[Tapnow] RunningHub v2 Upload Error:', err);
-                    throw err;
+                    console.error('[RunningHub SDK] 轮询失败:', err);
+                    setHistory((prev) => prev.map((hItem) => hItem.id === taskId ? { ...hItem, status: 'failed', errorMsg: err.message || '轮询失败' } : hItem));
                 }
             };
 
-            // ===== RunningHub 启动工作流函数（v2 API）=====
+            // uploadToRunningHub — 使用 SDK 上传图片（v2 API）
+            const uploadToRunningHub = async (imageData) => {
+                return await RH_SDK.uploadMediaV2({ image: imageData, apiKey: runninghubApiKey });
+            };
+
+            // runRunningHubWorkflow — 使用 SDK 启动工作流
             const runRunningHubWorkflow = async (workflowId, nodeInfoList, taskId, sourceNodeId, w, h, isVideoWorkflow = false) => {
                 try {
-                    // RunningHub v2 API AI 应用：/openapi/v2/run/ai-app/{webappId}
-                    // 文档参考：https://www.runninghub.cn/runninghub-api-doc-cn
-                    // 认证方式：Authorization: Bearer {apiKey}
-                    const url = `${RUNNINGHUB_BASE_URL}/openapi/v2/run/ai-app/${workflowId}`;
-                    const payload = {
-                        nodeInfoList: nodeInfoList,
-                        instanceType: 'default',
-                        usePersonalQueue: 'false'
-                    };
-
-                    const resp = await fetch(url, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${runninghubApiKey}`
-                        },
-                        body: JSON.stringify(payload)
+                    // 判断是工作流模式还是 AI App 模式
+                    // AI App 使用 /openapi/v2/run/ai-app/{appId}
+                    const { taskId: remoteTaskId } = await RH_SDK.runAiApp({
+                        apiKey: runninghubApiKey,
+                        appId: workflowId,
+                        nodeInfoList,
                     });
-
-                    if (!resp.ok) {
-                        const errText = await resp.text();
-                        console.error('[Tapnow] RunningHub v2 Run Workflow HTTP Error:', resp.status, errText);
-                        throw new Error(`启动工作流失败: HTTP ${resp.status}`);
-                    }
-
-                    const data = await resp.json();
-                    console.log('[Tapnow] RunningHub v2 Run Workflow Request:', JSON.stringify(payload, null, 2));
-                    console.log('[Tapnow] RunningHub v2 Run Workflow Response:', JSON.stringify(data, null, 2));
-
-                    // v2 API 返回格式：{ taskId, status, errorCode, errorMessage, results, ... }
-                    if (data.taskId) {
-                        const remoteTaskId = data.taskId;
-                        const initialStatus = data.status; // QUEUED, RUNNING
-                        // 更新历史记录中的远程任务ID
-                        setHistory((prev) => prev.map((hItem) =>
-                            hItem.id === taskId
-                                ? { ...hItem, remoteTaskId, errorMsg: initialStatus === 'QUEUED' ? '排队中' : '运行中' }
-                                : hItem
-                        ));
-                        // 开始轮询，传入视频标记
-                        pollRunningHubJob(remoteTaskId, workflowId, nodeInfoList, sourceNodeId, w, h, 0, isVideoWorkflow);
-                    } else {
-                        // 打印完整的响应以便调试
-                        console.error('[Tapnow] RunningHub v2 Error Response:', JSON.stringify(data, null, 2));
-                        throw new Error(data.errorMessage || data.message || data.errorCode || '启动工作流失败');
-                    }
+                    const initialStatus = 'QUEUED';
+                    setHistory((prev) => prev.map((hItem) =>
+                        hItem.id === taskId
+                            ? { ...hItem, remoteTaskId, errorMsg: '排队中' }
+                            : hItem
+                    ));
+                    pollRunningHubJob(remoteTaskId, workflowId, nodeInfoList, sourceNodeId, w, h, isVideoWorkflow);
                 } catch (err) {
-                    console.error('[Tapnow] RunningHub v2 Run Workflow Error:', err);
+                    console.error('[RunningHub SDK] 启动工作流失败:', err);
                     setHistory((prev) => prev.map((hItem) =>
                         hItem.id === taskId
                             ? { ...hItem, status: 'failed', errorMsg: err.message || 'RunningHub 工作流启动失败' }
@@ -5650,122 +5969,14 @@ You must design a visual composition that tells the story through **8 distinct p
                 }
             };
 
-            // ===== 获取 RunningHub 工作流 JSON 配置 =====
+            // getRunningHubWorkflowJson — 使用 SDK 获取工作流 JSON
             const getRunningHubWorkflowJson = async (workflowId) => {
-                try {
-                    const resp = await fetch(`${RUNNINGHUB_BASE_URL}/api/comfyui/workflow/json`, {
-                        method: 'POST',
-                        headers: {
-                            'Authorization': `Bearer ${runninghubApiKey}`,
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({ workflowId })
-                    });
-
-                    if (!resp.ok) {
-                        throw new Error(`获取工作流配置失败: HTTP ${resp.status}`);
-                    }
-
-                    const data = await resp.json();
-                    console.log('[Tapnow] RunningHub Workflow JSON:', data);
-
-                    if (data.code === 0) {
-                        return data.data; // 返回工作流JSON配置
-                    } else {
-                        throw new Error(data.msg || data.message || '获取工作流配置失败');
-                    }
-                } catch (err) {
-                    console.error('[Tapnow] RunningHub Workflow JSON Error:', err);
-                    throw err;
-                }
+                return await RH_SDK.getWorkflowJson({ apiKey: runninghubApiKey, workflowId });
             };
 
-            // ===== 自动发现工作流节点映射 =====
-            // 分析工作流 JSON，找到图片/视频/文本输入节点
+            // discoverWorkflowNodes — 使用 SDK 自动发现节点
             const discoverWorkflowNodes = (workflowJson) => {
-                const imageNodes = [];   // 图片输入节点
-                const videoNodes = [];   // 视频输入节点
-                const textNodes = [];    // 文本输入节点
-                const paramNodes = [];   // 其他参数节点
-
-                // ComfyUI 常见的输入节点类型
-                const IMAGE_NODE_TYPES = ['LoadImage', 'LoadImageBHB', 'LoadImagesFromFolder'];
-                const VIDEO_NODE_TYPES = ['LoadVideo', 'LoadVideoPath', 'LoadVideoNode'];
-                const TEXT_NODE_TYPES = ['CLIPTextEncode', 'TextEncode'];
-                const PARAM_NODE_TYPES = ['EmptyLatentImage', 'ControlNetLoader', 'KSampler'];
-
-                if (!workflowJson || typeof workflowJson !== 'object') {
-                    console.warn('[Tapnow] 工作流JSON格式无效');
-                    return { imageNodes, videoNodes, textNodes, paramNodes };
-                }
-
-                // 遍历工作流节点
-                for (const [nodeId, nodeConfig] of Object.entries(workflowJson)) {
-                    if (!nodeConfig || !nodeConfig.class_type) continue;
-
-                    const classType = nodeConfig.class_type;
-                    const inputs = nodeConfig.inputs || {};
-
-                    // 检查是否是图片输入节点
-                    if (IMAGE_NODE_TYPES.includes(classType)) {
-                        // LoadImage 节点的 image 字段就是图片
-                        if ('image' in inputs) {
-                            imageNodes.push({
-                                nodeId,
-                                fieldName: 'image',
-                                classType
-                            });
-                        }
-                    }
-
-                    // 检查是否是视频输入节点
-                    if (VIDEO_NODE_TYPES.includes(classType)) {
-                        // 视频节点通常有 video 或 video_path 字段
-                        const videoField = inputs.video ? 'video' : inputs.video_path ? 'video_path' : null;
-                        if (videoField) {
-                            videoNodes.push({
-                                nodeId,
-                                fieldName: videoField,
-                                classType
-                            });
-                        }
-                    }
-
-                    // 检查是否是文本输入节点
-                    if (TEXT_NODE_TYPES.includes(classType)) {
-                        // CLIPTextEncode 节点的 text 字段就是提示词
-                        if ('text' in inputs) {
-                            textNodes.push({
-                                nodeId,
-                                fieldName: 'text',
-                                classType
-                            });
-                        }
-                    }
-
-                    // 检查是否有其他可调参数（resolution, seed, steps 等）
-                    const paramFields = ['resolution', 'width', 'height', 'seed', 'steps', 'cfg', 'denoise', 'sampler_name'];
-                    for (const field of paramFields) {
-                        if (field in inputs) {
-                            paramNodes.push({
-                                nodeId,
-                                fieldName: field,
-                                classType,
-                                currentValue: inputs[field]
-                            });
-                            break; // 只记录一次
-                        }
-                    }
-                }
-
-                console.log('[Tapnow] 发现的工作流节点:', {
-                    images: imageNodes,
-                    videos: videoNodes,
-                    texts: textNodes,
-                    params: paramNodes.slice(0, 5) // 只显示前5个
-                });
-
-                return { imageNodes, videoNodes, textNodes, paramNodes };
+                return RH_SDK.discoverWorkflowNodes(workflowJson);
             };
 
             // 切割Midjourney返回的4张图（2x2网格）
@@ -6730,6 +6941,124 @@ You must design a visual composition that tells the story through **8 distinct p
                 }
             };
 
+            // Seedance 视频生成任务轮询
+            const pollSeedanceTask = async (taskId, remoteTaskId, baseUrl, apiKey, w, h, sourceNodeId, attempt = 0) => {
+                const maxAttempts = 360; // 最多轮询 360 次（约 30 分钟，每 5 秒一次）
+                const pollInterval = 5000; // 5 秒
+                const queryUrl = `${baseUrl}/seedance/v3/contents/generations/tasks/${remoteTaskId}`;
+
+                console.log(`[Seedance] 轮询任务状态: ${remoteTaskId}, 第 ${attempt + 1}/${maxAttempts} 次`);
+
+                try {
+                    const resp = await fetch(queryUrl, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${apiKey}`
+                        }
+                    });
+
+                    if (!resp.ok) {
+                        const errText = await resp.text();
+                        console.error('[Seedance] 轮询请求失败:', { status: resp.status, error: errText });
+                        // 网络错误，继续重试
+                        if (attempt < maxAttempts - 1) {
+                            setTimeout(() => pollSeedanceTask(taskId, remoteTaskId, baseUrl, apiKey, w, h, sourceNodeId, attempt + 1), pollInterval);
+                        } else {
+                            throw new Error(`轮询超时，超过最大尝试次数 ${maxAttempts}`);
+                        }
+                        return;
+                    }
+
+                    const data = await resp.json();
+                    console.log('[Seedance] 轮询响应:', JSON.stringify(data).substring(0, 300));
+
+                    const status = data.status || data.data?.status;
+                    const progress = data.progress || data.data?.progress;
+
+                    // 检查任务状态
+                    if (status === 'succeeded' || status === 'completed' || status === 'SUCCESS') {
+                        // 任务完成，提取视频 URL
+                        let videoUrl = null;
+                        
+                        // 尝试多种可能的响应格式
+                        if (data.data?.content?.[0]?.video_url?.url) {
+                            videoUrl = data.data.content[0].video_url.url;
+                        } else if (data.data?.video_url?.url) {
+                            videoUrl = data.data.video_url.url;
+                        } else if (data.content?.[0]?.video_url?.url) {
+                            videoUrl = data.content[0].video_url.url;
+                        } else if (data.content?.video_url) {
+                            // Comfly 官方格式：content 是对象，video_url 直接是字符串
+                            videoUrl = data.content.video_url;
+                        } else if (data.video_url?.url) {
+                            videoUrl = data.video_url.url;
+                        } else if (data.video_url) {
+                            videoUrl = data.video_url;
+                        } else if (data.data?.output?.video_url) {
+                            videoUrl = data.data.output.video_url;
+                        }
+
+                        if (!videoUrl) {
+                            console.error('[Seedance] 任务完成但未找到视频 URL，完整响应:', JSON.stringify(data));
+                            throw new Error('任务完成但未返回视频 URL');
+                        }
+
+                        console.log('[Seedance] 视频生成完成:', videoUrl);
+
+                        const endTime = Date.now();
+                        const historyItem = historyMap.get(taskId);
+                        const startTime = historyItem?.startTime || endTime;
+                        const durationMs = endTime - startTime;
+
+                        setHistory((prev) => {
+                            const updated = prev.map((hItem) =>
+                                hItem.id === taskId
+                                    ? { ...hItem, status: 'completed', progress: 100, url: videoUrl, width: w, height: h, durationMs, type: 'video' }
+                                    : hItem
+                            );
+                            
+                            // 更新预览窗口
+                            const updatedItem = updated.find(h => h.id === taskId);
+                            if (updatedItem?.sourceNodeId) {
+                                setTimeout(() => {
+                                    console.log('[Seedance] 准备更新预览窗口', { taskId, url: videoUrl, sourceNodeId: updatedItem.sourceNodeId });
+                                    updatePreviewFromTask(taskId, videoUrl, 'video', updatedItem.sourceNodeId);
+                                }, 0);
+                            }
+                            
+                            return updated;
+                        });
+                        return;
+                    } else if (status === 'failed' || status === 'error' || status === 'FAILURE') {
+                        const errorMsg = data.error?.message || data.error || data.data?.error?.message || '视频生成失败';
+                        throw new Error(errorMsg);
+                    }
+
+                    // 任务仍在进行中，更新进度
+                    const progressValue = progress ? Math.min(95, progress) : Math.min(95, 10 + (attempt * 2));
+                    setHistory((prev) => prev.map((hItem) =>
+                        hItem.id === taskId
+                            ? { ...hItem, status: 'generating', progress: Math.round(progressValue) }
+                            : hItem
+                    ));
+
+                    // 继续轮询
+                    if (attempt < maxAttempts - 1) {
+                        setTimeout(() => pollSeedanceTask(taskId, remoteTaskId, baseUrl, apiKey, w, h, sourceNodeId, attempt + 1), pollInterval);
+                    } else {
+                        throw new Error(`轮询超时，超过最大尝试次数 ${maxAttempts}`);
+                    }
+                } catch (err) {
+                    const errMsg = err.message || String(err);
+                    console.error('[Seedance] 轮询错误:', err);
+                    setHistory((prev) => prev.map((hItem) =>
+                        hItem.id === taskId
+                            ? { ...hItem, status: 'failed', errorMsg: errMsg }
+                            : hItem
+                    ));
+                }
+            };
+
             const startGeneration = async (prompt, type, sourceImages, nodeId, options = {}) => {
                 const connectedImages = Array.isArray(sourceImages) ? sourceImages : (sourceImages ? [sourceImages] : []);
                 const sourceImage = connectedImages.length > 0 ? connectedImages[0] : undefined;
@@ -6794,7 +7123,7 @@ You must design a visual composition that tells the story through **8 distinct p
                 // 优先使用 options 中的 model，其次使用节点设置，最后使用默认值
                 const modelId = options.model || node?.settings?.model || (type === 'image' ? 'nano-banana' : 'runninghub-video');
                 const config = apiConfigsMap.get(modelId);
-                const apiKey = config?.key || globalApiKey;
+                const apiKey = globalApiKey || config?.key;
                 const baseUrl = (config?.url || DEFAULT_BASE_URL).replace(/\/+$/, '');
 
                 if (!apiKey) { alert('请先在设置中配置 API Key'); setSettingsOpen(true); return; }
@@ -6850,7 +7179,9 @@ You must design a visual composition that tells the story through **8 distinct p
 
                 // 当有参考图且选择了 Auto + (1K/2K/4K) 时：
                 // 希望保持原图纵横比，只在原图分辨率基础上等比放大到目标级别（而不是变成固定 1:1 或 16:9）
-                if (sourceImage && ratio === 'Auto' && ['1K', '2K', '4K'].includes(resolution)) {
+                // [修复] gpt-image-2 不使用此逻辑，它有自己的 GPT_IMAGE2_SIZE_MAP 预设尺寸
+                const isGptImage2Model = modelId.includes('gpt-image-2') || (config?.modelName || '').includes('gpt-image-2');
+                if (sourceImage && ratio === 'Auto' && ['1K', '2K', '4K'].includes(resolution) && !isGptImage2Model) {
                     try {
                         const dims = await getImageDimensions(sourceImage);
                         const longSideTarget = resolution === '4K'
@@ -6891,6 +7222,8 @@ You must design a visual composition that tells the story through **8 distinct p
                         if (modelId.includes('jimeng-3.1')) return 'Jimeng 3.1';
                         // 如果是RunningHub工作流
                         if (config?.isRunningHub) return config?.provider || 'RunningHub 工作流';
+                        // 如果是RunningHub模型API
+                        if (config?.isRhModel) return `RH ${runninghubModelId || 'Model'}`;
                         // 其他模型使用config中的provider，如果没有则使用modelId
                         return config?.provider || modelId;
                     };
@@ -7063,17 +7396,83 @@ You must design a visual composition that tells the story through **8 distinct p
                             return; // ★ GRS AI 完成，直接返回，不走后面的通用逻辑
                         }
 
-                        // ★ RunningHub 工作流
-                        const isRunningHub = modelId === 'runninghub-workflow' || modelId === 'runninghub-image' || modelId === 'runninghub-video' || config?.isRunningHub === true;
+                        // ★ RunningHub 工作流 / 模型 API
+                        const isRunningHub = modelId === 'runninghub-workflow' || modelId === 'runninghub-image' || modelId === 'runninghub-video' || modelId === 'runninghub-model' || config?.isRunningHub === true;
                         if (isRunningHub) {
-                            // 获取节点设置中的 Workflow ID（优先使用节点独立的设置）
-                            const nodeWorkflowId = node?.settings?.runninghubWorkflowId;
-                            const effectiveWorkflowId = nodeWorkflowId || runninghubWorkflowId;
-
                             // 检查是否配置了 RunningHub
                             if (!runninghubApiKey) {
                                 throw new Error('请先在设置中配置 RunningHub API Key');
                             }
+
+                            // ★ 模型 API 模式（isRhModel）— 直接调用模型
+                            const isRhModel = config?.isRhModel || modelId === 'runninghub-model';
+                            if (isRhModel) {
+                                const rhModel = node?.settings?.rhModelId || runninghubModelId || 'seedream-v4.5';
+                                const rhNegativePrompt = node?.settings?.negativePrompt || '';
+                                const rhRatio = node?.settings?.ratio || '1:1';
+                                const rhQuality = node?.settings?.defaultResolution || '2K';
+                                console.log(`[RunningHub Model API] 模型: ${rhModel}, 提示词: ${prompt?.slice(0, 50)}`);
+
+                                // 上传参考图获取 URL
+                                const inputImageUrls = [];
+                                const allImages = [...connectedImages];
+                                if (sourceImage && !allImages.includes(sourceImage)) allImages.push(sourceImage);
+                                for (const img of allImages) {
+                                    try {
+                                        const uploadResult = await uploadToRunningHub(img);
+                                        inputImageUrls.push(uploadResult.url);
+                                    } catch (uploadErr) {
+                                        console.warn(`[RunningHub Model API] 参考图上传失败:`, uploadErr);
+                                    }
+                                }
+
+                                // 使用 SDK 一站式生图
+                                (async () => {
+                                    try {
+                                        const urls = await RH_SDK.generateWithModel({
+                                            apiKey: runninghubApiKey,
+                                            model: rhModel,
+                                            prompt: prompt || '',
+                                            negativePrompt: rhNegativePrompt,
+                                            aspectRatio: rhRatio === 'Auto' ? '1:1' : rhRatio,
+                                            imageSize: rhQuality,
+                                            inputImages: inputImageUrls,
+                                            onProgress: (status, data) => {
+                                                if (status === 'submitted') {
+                                                    setHistory((prev) => prev.map((hItem) => hItem.id === taskId ? { ...hItem, remoteTaskId: data.taskId, errorMsg: '排队中' } : hItem));
+                                                } else {
+                                                    const progress = Math.min(95, status === 'pending' ? 10 : 30);
+                                                    setHistory((prev) => prev.map((hItem) => hItem.id === taskId ? { ...hItem, status: 'generating', progress, errorMsg: status === 'pending' ? '排队中' : '运行中' } : hItem));
+                                                }
+                                            }
+                                        });
+                                        if (urls.length > 0) {
+                                            const endTime = Date.now();
+                                            const historyItem = historyMap.get(taskId);
+                                            const startTime = historyItem?.startTime || endTime;
+                                            const durationMs = endTime - startTime;
+                                            setHistory((prev) => {
+                                                const updated = prev.map((hItem) => hItem.id === taskId ? { ...hItem, status: 'completed', progress: 100, url: urls[0], width: w, height: h, durationMs } : hItem);
+                                                const updatedItem = updated.find(h => h.id === taskId);
+                                                if (updatedItem?.sourceNodeId) setTimeout(() => updatePreviewFromTask(taskId, urls[0], 'image', updatedItem.sourceNodeId), 0);
+                                                return updated;
+                                            });
+                                        } else {
+                                            setHistory((prev) => prev.map((hItem) => hItem.id === taskId ? { ...hItem, status: 'failed', errorMsg: '模型 API 未返回图片' } : hItem));
+                                        }
+                                    } catch (err) {
+                                        console.error('[RunningHub Model API] 生成失败:', err);
+                                        setHistory((prev) => prev.map((hItem) => hItem.id === taskId ? { ...hItem, status: 'failed', errorMsg: err.message || '模型 API 生成失败' } : hItem));
+                                    }
+                                })();
+                                return; // ★ RunningHub 模型 API 已提交
+                            }
+
+                            // ★ 工作流模式
+                            // 获取节点设置中的 Workflow ID（优先使用节点独立的设置）
+                            const nodeWorkflowId = node?.settings?.runninghubWorkflowId;
+                            const effectiveWorkflowId = nodeWorkflowId || runninghubWorkflowId;
+
                             if (!effectiveWorkflowId) {
                                 if (nodeWorkflowId === undefined && !runninghubWorkflowId) {
                                     throw new Error('请在设置中配置 RunningHub Workflow ID');
@@ -7285,57 +7684,82 @@ You must design a visual composition that tells the story through **8 distinct p
                             payload = formData;
                         }
                         else if (isOpenAIImage) {
-                            // gpt-image-2 官方分组使用 multipart/form-data 格式（Comfly_gpt_image_2_official）
-                            // 端点：/v1/images/edits?async=true（必须异步模式才能出4K）
-                            endpoint = `${baseUrl}/v1/images/edits?async=true`;
-                            useMultipart = true;
-                            const formData = new FormData();
-
                             const finalPrompt = prompt || '';
-                            formData.append('model', config?.modelName || 'gpt-image-2');
-                            formData.append('prompt', finalPrompt);
-                            formData.append('n', '1');
-                            formData.append('quality', node?.settings?.gptImageQuality || 'auto');
-                            formData.append('moderation', 'auto');
-                            // [修复2] 添加 background 参数（Comfly 官方支持 auto/opaque）
-                            formData.append('background', 'auto');
-                            formData.append('output_format', 'png');
-                            formData.append('output_compression', '100');
+                            const gptQuality = node?.settings?.gptImageQuality || 'auto';
 
-                            // size 只在非 auto 时传
-                            if (sizeStr && sizeStr !== 'auto') {
-                                formData.append('size', sizeStr);
-                            }
-
-                            // [修复1] 参考图：使用 Blob 格式，并通过 downscaleInputImage 缩放到 ≤157万像素
-                            // Comfly 官方要求输入图像素数不超过 ~1536×1024 (1572864)
-                            if (connectedImages.length > 0) {
-                                const blobPromises = connectedImages.map(url => downscaleInputImage(url));
-                                const blobs = await Promise.all(blobPromises);
-                                blobs.forEach((blob, i) => {
-                                    formData.append('image', blob, `input_${i}.png`);
-                                });
-                                console.log('[gpt-image-2] 参考图数量:', blobs.length, '(已缩放至 ≤1536×1024)');
-                            } else {
-                                // [修复6] 纯文生图：生成 1x1 透明 PNG 作为最小占位图（Comfly 官方做法）
-                                const placeholderCanvas = document.createElement('canvas');
-                                placeholderCanvas.width = 1;
-                                placeholderCanvas.height = 1;
-                                const placeholderBlob = await new Promise(resolve => {
-                                    placeholderCanvas.toBlob(resolve, 'image/png');
-                                });
-                                formData.append('image', placeholderBlob, 'blank.png');
-                                console.log('[gpt-image-2] 纯文生图，使用 1x1 透明占位图');
-                            }
-
-                            // 蒙版（Inpainting）
+                            // gpt-image-2 两种请求模式：
+                            // 1. 无蒙版：/v1/images/generations + JSON（中转站后台可见记录，与 Comfly_gpt_image_2 类一致）
+                            // 2. 有蒙版(Inpainting)：/v1/images/edits + multipart（edits 端点才支持 mask）
                             if (finalMaskBlob) {
+                                // Inpainting 模式：使用 edits 端点 + multipart
+                                endpoint = `${baseUrl}/v1/images/edits?async=true`;
+                                useMultipart = true;
+                                const formData = new FormData();
+                                formData.append('model', config?.modelName || 'gpt-image-2');
+                                formData.append('prompt', finalPrompt);
+                                formData.append('n', '1');
+                                formData.append('quality', gptQuality);
+                                formData.append('moderation', 'auto');
+                                formData.append('background', 'auto');
+                                formData.append('output_format', 'png');
+                                formData.append('output_compression', '100');
+                                if (sizeStr && sizeStr !== 'auto') {
+                                    formData.append('size', sizeStr);
+                                }
+                                // 参考图（Inpainting 必须有源图）
+                                if (connectedImages.length > 0) {
+                                    const blobPromises = connectedImages.map(url => downscaleInputImage(url));
+                                    const blobs = await Promise.all(blobPromises);
+                                    blobs.forEach((blob, i) => {
+                                        formData.append('image', blob, `input_${i}.png`);
+                                    });
+                                    console.log('[gpt-image-2 Inpainting] 参考图数量:', blobs.length, '(已缩放至 ≤1536×1024)');
+                                } else {
+                                    // Inpainting 没有源图，用占位图
+                                    const placeholderCanvas = document.createElement('canvas');
+                                    placeholderCanvas.width = 1;
+                                    placeholderCanvas.height = 1;
+                                    const placeholderBlob = await new Promise(resolve => {
+                                        placeholderCanvas.toBlob(resolve, 'image/png');
+                                    });
+                                    formData.append('image', placeholderBlob, 'blank.png');
+                                }
                                 formData.append('mask', finalMaskBlob, 'mask.png');
-                                console.log('[Inpainting] 已添加处理后的蒙版数据');
+                                console.log('[Inpainting] 已添加处理后的蒙版数据 (edits/multipart 模式)');
+                                console.log('[gpt-image-2] Inpainting 请求构建完成 (edits/multipart/async):', { model: config?.modelName || 'gpt-image-2', size: sizeStr, quality: gptQuality, hasMask: true });
+                                payload = formData;
+                            } else {
+                                // 标准/文生图/图改图模式：使用 generations 端点 + JSON（中转站后台可见记录）
+                                endpoint = `${baseUrl}/v1/images/generations?async=true`;
+                                useMultipart = false;
+                                const jsonBody = {
+                                    model: config?.modelName || 'gpt-image-2',
+                                    prompt: finalPrompt,
+                                    n: 1,
+                                    quality: gptQuality,
+                                    moderation: 'auto',
+                                    background: 'auto',
+                                    output_format: 'png',
+                                    output_compression: 100,
+                                };
+                                if (sizeStr && sizeStr !== 'auto') {
+                                    jsonBody.size = sizeStr;
+                                }
+                                // 参考图：转为 base64 data URI 放入 image 数组（与 Comfly_gpt_image_2 一致）
+                                if (connectedImages.length > 0) {
+                                    const imageArray = [];
+                                    for (const imgUrl of connectedImages) {
+                                        const dataUri = await downscaleImageToDataUri(imgUrl);
+                                        if (dataUri) imageArray.push(dataUri);
+                                    }
+                                    if (imageArray.length > 0) {
+                                        jsonBody.image = imageArray;
+                                        console.log('[gpt-image-2] 参考图数量:', imageArray.length, '(已缩放至 ≤1536×1024, base64 data URI)');
+                                    }
+                                }
+                                console.log('[gpt-image-2] 标准请求构建完成 (generations/JSON/async):', { model: jsonBody.model, size: jsonBody.size, quality: jsonBody.quality, hasImages: !!jsonBody.image, promptLength: finalPrompt.length });
+                                payload = jsonBody;
                             }
-
-                            console.log('[gpt-image-2 Official] 请求构建完成 (multipart/async):', { model: config?.modelName || 'gpt-image-2', size: sizeStr, quality: node?.settings?.gptImageQuality || 'auto', hasImages: connectedImages.length > 0, promptLength: finalPrompt.length, background: 'auto' });
-                            payload = formData;
                     } else if (isNanoBanana2) {
                         // Nano-banana-2 统一使用 /v1/images/generations (application/json)
                         // 有参考图时通过 image 数组传递，无参考图时不传 image
@@ -8157,10 +8581,15 @@ You must design a visual composition that tells the story through **8 distinct p
                                 throw new Error(`Image API错误: ${errorMsg}`);
                             }
 
-                            // gpt-image-2 官方分组异步模式：检测 task_id
-                            const isGptImage2Official = (config?.modelName ?? '').includes('gpt-image-2');
-                            const remoteTaskId = data?.task_id || data?.data;
-                            if (isGptImage2Official && remoteTaskId && typeof remoteTaskId === 'string') {
+                            // gpt-image-2 异步模式：检测 task_id（兼容 edits 和 generations 端点）
+                            // 返回格式：{ task_id: "xxx" } 或 { data: "task_id_string" } 或 { code: 0, data: "task_id_string" }
+                            const isGptImage2Model = (config?.modelName ?? '').includes('gpt-image-2');
+                            let remoteTaskId = data?.task_id || null;
+                            // data.data 可能是字符串 task_id，也可能是图片数组（同步响应）
+                            if (!remoteTaskId && data?.data && typeof data.data === 'string') {
+                                remoteTaskId = data.data;
+                            }
+                            if (isGptImage2Model && remoteTaskId) {
                                 console.log('[gpt-image-2] 异步模式：收到 task_id:', remoteTaskId, '启动轮询');
                                 // 更新历史记录状态
                                 setHistory((prev) => prev.map((hItem) =>
@@ -8278,7 +8707,7 @@ You must design a visual composition that tells the story through **8 distinct p
 
                     if (type === 'video') {
                         // ★ RunningHub 视频工作流（需要在其他视频 API 之前检查）
-                        const isRunningHubVideo = modelId === 'runninghub-video' || config?.isRunningHub === true;
+                        const isRunningHubVideo = modelId === 'runninghub-video' || modelId === 'runninghub-model' || config?.isRunningHub === true;
                         if (isRunningHubVideo) {
                             // 获取节点设置中的 Workflow ID（优先使用节点独立的设置）
                             const nodeWorkflowId = node?.settings?.runninghubWorkflowId;
@@ -8449,6 +8878,101 @@ You must design a visual composition that tells the story through **8 distinct p
                             console.log(`[RunningHub Video] 最终 nodeInfoList:`, JSON.stringify(nodeInfoList, null, 2));
                             await runRunningHubWorkflow(effectiveWorkflowId, nodeInfoList, taskId, actualSourceNodeId, w, h, true);
                             return; // ★ RunningHub 启动完成，等待轮询结果
+                        }
+
+                        // ★ Seedance 2.0 视频生成（火山引擎方舟大模型）
+                        const isSeedance = config?.isSeedance === true || modelId === 'seedance-2' || modelId === 'seedance-2-fast';
+                        if (isSeedance) {
+                            const seedanceEndpoint = `${baseUrl}/seedance/v3/contents/generations/tasks`;
+                            
+                            // 从节点设置获取 Seedance 专用参数（优先使用，否则回退到通用设置）
+                            const seedanceSettings = node?.settings || {};
+                            const sdRatio = seedanceSettings.seedanceRatio || (ratio === 'Auto' ? '16:9' : ratio);
+                            const sdDuration = parseInt(seedanceSettings.seedanceDuration) || parseInt(duration) || 5;
+
+                            console.log('[Seedance] 开始视频生成:', { model: config?.modelName, prompt: prompt?.slice(0, 50), ratio: sdRatio, duration: sdDuration });
+
+                            // 构建 content 数组
+                            const contentItems = [];
+                            
+                            // 添加文本提示词
+                            if (prompt) {
+                                contentItems.push({ type: 'text', text: prompt });
+                            }
+
+                            // 上传参考图并添加到 content
+                            if (connectedImages.length > 0) {
+                                for (const img of connectedImages) {
+                                    try {
+                                        // Seedance 支持直接传 URL，如果是 data URL 需要先上传
+                                        if (img.startsWith('data:')) {
+                                            // 将 data URL 上传到临时图床或转为公网可访问 URL
+                                            // 这里假设中转服务支持 data URL 直接传递
+                                            contentItems.push({
+                                                type: 'image_url',
+                                                image_url: { url: img },
+                                                role: 'reference_image'
+                                            });
+                                        } else {
+                                            contentItems.push({
+                                                type: 'image_url',
+                                                image_url: { url: img },
+                                                role: 'reference_image'
+                                            });
+                                        }
+                                    } catch (uploadErr) {
+                                        console.warn('[Seedance] 参考图处理失败:', uploadErr);
+                                    }
+                                }
+                            }
+
+                            // 构建请求体
+                            const seedanceBody = {
+                                model: config?.modelName || 'doubao-seedance-2-0-260128',
+                                content: contentItems,
+                                ratio: sdRatio,
+                                duration: sdDuration,
+                                watermark: false
+                            };
+
+                            console.log('[Seedance] 请求参数:', JSON.stringify(seedanceBody, null, 2));
+
+                            // 发送请求
+                            const seedanceResp = await fetch(seedanceEndpoint, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${apiKey}`
+                                },
+                                body: JSON.stringify(seedanceBody)
+                            });
+
+                            const seedanceText = await seedanceResp.text();
+                            console.log('[Seedance] 响应:', seedanceText);
+
+                            if (!seedanceResp.ok) {
+                                throw new Error(`Seedance API 错误 (${seedanceResp.status}): ${seedanceText}`);
+                            }
+
+                            const seedanceData = JSON.parse(seedanceText);
+                            const remoteTaskId = seedanceData.id || seedanceData.task_id || seedanceData.data?.id;
+                            
+                            if (!remoteTaskId) {
+                                throw new Error('未获取到 Seedance 任务 ID');
+                            }
+
+                            console.log('[Seedance] 任务已创建:', remoteTaskId);
+
+                            // 更新历史记录
+                            setHistory((prev) => prev.map((hItem) =>
+                                hItem.id === taskId
+                                    ? { ...hItem, remoteTaskId, status: 'generating', progress: 10 }
+                                    : hItem
+                            ));
+
+                            // 开始轮询任务状态
+                            pollSeedanceTask(taskId, remoteTaskId, baseUrl, apiKey, w, h, actualSourceNodeId);
+                            return; // ★ Seedance 启动完成，等待轮询结果
                         }
 
                         // Veo 3.x 图生视频：按 /v2/videos/generations 规范发送 JSON，使用 images 数组而不是 input_image
@@ -9225,7 +9749,7 @@ You must design a visual composition that tells the story through **8 distinct p
                     settings: type === 'gen-image'
                         ? { model: 'nano-banana', ratio: 'Auto', resolution: 'Auto', prompt: '' }
                         : type === 'gen-video'
-                            ? { model: 'sora-2', duration: '5s', ratio: '16:9', videoPrompt: '' }
+                            ? { model: 'runninghub-video', duration: '5s', ratio: '16:9', videoPrompt: '' }
                             : type === 'expand-node'
                                 ? { model: 'gemini-3.1-flash-image-preview', ratio: 'Auto', resolution: '2K', expandPromptTemplate: '', expandScale: 80, targetRatio: '21:9' }
                                 : type === 'panorama-node'
@@ -9662,7 +10186,7 @@ You must design a visual composition that tells the story through **8 distinct p
                 }
 
                 // 2. 获取选中的视频模型（必须选择视频模型）
-                const selectedModel = shot.model || (apiConfigs.find(c => c.type === 'Video' && c.id === 'sora-2')?.id || apiConfigs.find(c => c.type === 'Video')?.id || '');
+                const selectedModel = shot.model || (apiConfigs.find(c => c.type === 'Video' && c.isRunningHub)?.id || apiConfigs.find(c => c.type === 'Video')?.id || '');
                 const modelConfig = apiConfigsMap.get(selectedModel);
                 
                 if (!modelConfig || modelConfig.type !== 'Video') {
@@ -9968,7 +10492,7 @@ You must design a visual composition that tells the story through **8 distinct p
                 }
                 
                 const config = apiConfigs.find((c) => c.id === node.settings?.model || 'gemini-3-pro');
-                const apiKey = config?.key || globalApiKey;
+                const apiKey = globalApiKey || config?.key;
                 const baseUrl = (config?.url || DEFAULT_BASE_URL).replace(/\/+$/, '');
                 
                 if (!apiKey) {
@@ -10306,7 +10830,7 @@ You must design a visual composition that tells the story through **8 distinct p
                     config = apiConfigs.find((c) => c.type === 'Chat');
                 }
                 
-                const apiKey = config?.key || globalApiKey;
+                const apiKey = globalApiKey || config?.key;
                 const baseUrl = (config?.url || DEFAULT_BASE_URL).replace(/\/+$/, '');
                 
                 if (!apiKey) {
@@ -11217,7 +11741,7 @@ You must design a visual composition that tells the story through **8 distinct p
                 }
                 
                 const config = apiConfigs.find((c) => c.id === node.settings?.model || 'gemini-3-pro');
-                const apiKey = config?.key || globalApiKey;
+                const apiKey = globalApiKey || config?.key;
                 const baseUrl = (config?.url || DEFAULT_BASE_URL).replace(/\/+$/, '');
                 
                 if (!apiKey) {
@@ -12618,7 +13142,7 @@ You must design a visual composition that tells the story through **8 distinct p
                                                 updateNodeSettings(node.id, { isOptimizing: true });
                                                 
                                                 const config = apiConfigsMap.get(node.settings?.model || 'gemini-3-pro');
-                                                const apiKey = config?.key || globalApiKey;
+                                                const apiKey = globalApiKey || config?.key;
                                                 const baseUrl = (config?.url || DEFAULT_BASE_URL).replace(/\/+$/, '');
                                                 
                                                 if (!apiKey) {
@@ -13510,7 +14034,7 @@ You must design a visual composition that tells the story through **8 distinct p
                                                             <div className="flex gap-2 items-center flex-wrap">
                                                                 {/* Video Model Select */}
                                                                 <select
-                                                                    value={shot.model || (apiConfigs.find(c => c.type === 'Video' && c.id === 'sora-2')?.id || apiConfigs.find(c => c.type === 'Video')?.id || '')}
+                                                                    value={shot.model || (apiConfigs.find(c => c.type === 'Video' && c.isRunningHub)?.id || apiConfigs.find(c => c.type === 'Video')?.id || '')}
                                                                     onChange={(e) => {
                                                                         const newModel = e.target.value;
                                                                         const config = apiConfigs.find(c => c.id === newModel);
@@ -13554,7 +14078,7 @@ You must design a visual composition that tells the story through **8 distinct p
                                                                 
                                                                 {/* Duration Select */}
                                                                 {(() => {
-                                                                    const currentModel = shot.model || (apiConfigs.find(c => c.type === 'Video' && c.id === 'sora-2')?.id || apiConfigs.find(c => c.type === 'Video')?.id || '');
+                                                                    const currentModel = shot.model || (apiConfigs.find(c => c.type === 'Video' && c.isRunningHub)?.id || apiConfigs.find(c => c.type === 'Video')?.id || '');
                                                                     const config = apiConfigs.find(c => c.id === currentModel);
                                                                     const availableDurations = config?.durations || getDefaultDurationsForModel(currentModel);
                                                                     const defaultDuration = getDefaultDurationForModel(currentModel);
@@ -14684,22 +15208,46 @@ You must design a visual composition that tells the story through **8 distinct p
                                         {(node.type === 'gen-image' || node.type === 'gen-video') && (() => {
                                             const currentModel = apiConfigsMap.get(node.settings?.model);
                                             return currentModel?.isRunningHub;
-                                        })() && (
-                                            <div className="flex-1 min-w-0">
-                                                <input
-                                                    type="text"
-                                                    value={node.settings?.runninghubWorkflowId || ''}
-                                                    onChange={(e) => updateNodeSettings(node.id, { runninghubWorkflowId: e.target.value })}
-                                                    placeholder="Workflow ID（可选，留空用全局）"
-                                                    className={`w-full px-2 py-1 text-[10px] rounded border ${
-                                                        theme === 'dark'
-                                                            ? 'bg-zinc-800/50 border-zinc-700/50 text-zinc-300 placeholder:text-zinc-500'
-                                                            : 'bg-zinc-100 border-zinc-300 text-zinc-700 placeholder:text-zinc-400'
-                                                    }`}
-                                                    title="节点独立的工作流 ID（留空则使用全局设置）"
-                                                />
-                                            </div>
-                                        )}
+                                        })() && (() => {
+                                            const currentModel = apiConfigsMap.get(node.settings?.model);
+                                            const isRhModel = currentModel?.isRhModel || currentModel?.id === 'runninghub-model';
+                                            if (isRhModel) {
+                                                // 模型 API 模式 — 显示模型 ID 输入框
+                                                return (
+                                                    <div className="flex-1 min-w-0">
+                                                        <input
+                                                            type="text"
+                                                            value={node.settings?.rhModelId || ''}
+                                                            onChange={(e) => updateNodeSettings(node.id, { rhModelId: e.target.value })}
+                                                            placeholder={`模型 ID（默认: ${runninghubModelId}）`}
+                                                            className={`w-full px-2 py-1 text-[10px] rounded border ${
+                                                                theme === 'dark'
+                                                                    ? 'bg-zinc-800/50 border-zinc-700/50 text-zinc-300 placeholder:text-zinc-500'
+                                                                    : 'bg-zinc-100 border-zinc-300 text-zinc-700 placeholder:text-zinc-400'
+                                                            }`}
+                                                            title="RunningHub 模型 ID（如 seedream-v4.5, rhart-image-v1 等）"
+                                                        />
+                                                    </div>
+                                                );
+                                            }
+                                            // 工作流模式 — 显示 Workflow ID 输入框
+                                            return (
+                                                <div className="flex-1 min-w-0">
+                                                    <input
+                                                        type="text"
+                                                        value={node.settings?.runninghubWorkflowId || ''}
+                                                        onChange={(e) => updateNodeSettings(node.id, { runninghubWorkflowId: e.target.value })}
+                                                        placeholder="Workflow ID（可选，留空用全局）"
+                                                        className={`w-full px-2 py-1 text-[10px] rounded border ${
+                                                            theme === 'dark'
+                                                                ? 'bg-zinc-800/50 border-zinc-700/50 text-zinc-300 placeholder:text-zinc-500'
+                                                                : 'bg-zinc-100 border-zinc-300 text-zinc-700 placeholder:text-zinc-400'
+                                                        }`}
+                                                        title="节点独立的工作流 ID（留空则使用全局设置）"
+                                                    />
+                                                </div>
+                                            );
+                                        })()}
 
                                         {/* Midjourney版本选择器 */}
                                         {node.type === 'gen-image' && (() => {
@@ -14754,6 +15302,11 @@ You must design a visual composition that tells the story through **8 distinct p
                                         )}
 
                                         <div className="flex gap-1 shrink-0">
+                                            {/* ★ 通用比例控件 — Seedance 模型时隐藏 */}
+                                            {(() => {
+                                                const curModel = apiConfigsMap.get(node.settings?.model);
+                                                if (curModel?.isSeedance && node.type === 'gen-video') return null;
+                                                return (
                                             <div className="relative">
                                                 <button
                                                     onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'ratio' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'ratio' }); }}
@@ -14793,6 +15346,8 @@ You must design a visual composition that tells the story through **8 distinct p
                                                     </div>
                                                 )}
                                             </div>
+                                                );
+                                            })()}
 
                                             {node.type === 'gen-video' && (() => {
                                                 const currentModel = apiConfigsMap.get(node.settings?.model);
@@ -15043,8 +15598,12 @@ You must design a visual composition that tells the story through **8 distinct p
                                                 (() => {
                                                     const currentModel = apiConfigsMap.get(node.settings?.model);
                                                     const isMidjourney = currentModel && (currentModel.id.includes('mj') || currentModel.provider.toLowerCase().includes('midjourney'));
+                                                    const isSeedance = currentModel?.isSeedance === true;
+                                                    // ★ 修复：Seedance 模型不再 return null（会隐藏后续专用参数区），改为条件隐藏通用时长控件
                                                     return !isMidjourney ? (
                                                 <>
+                                                {/* 通用时长控件 — Seedance 模型时隐藏（由专用参数区替代） */}
+                                                {!isSeedance && (
                                                 <div className="relative">
                                                             <button
                                                                 onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'duration' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'duration' }); }}
@@ -15084,6 +15643,7 @@ You must design a visual composition that tells the story through **8 distinct p
                                                         </div>
                                                     )}
                                                 </div>
+                                                )}
                                                     {node.type === 'gen-video' && node.settings?.model === 'sora-2' && (
                                                         <label className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] border cursor-pointer transition-colors ${
                                                             theme === 'dark'
@@ -15135,10 +15695,6 @@ You must design a visual composition that tells the story through **8 distinct p
                                                         const currentModel = apiConfigsMap.get(node.settings?.model);
                                                         const isRHVideo = currentModel?.isRunningHub || currentModel?.id === 'runninghub-video';
                                                         if (!isRHVideo) return null;
-
-                                                        const RH_VIDEO_RATIOS = ['adaptive', '16:9', '4:3', '1:1', '3:4', '9:16', '21:9'];
-                                                        const RH_VIDEO_RESOLUTIONS = ['480p', '720p', '1080p', '2k', '4k'];
-                                                        const RH_VIDEO_DURATIONS = ['4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'];
 
                                                         return (
                                                             <div className={`mt-2 pt-2 border-t space-y-2 ${theme === 'dark' ? 'border-zinc-700/50' : 'border-zinc-200'}`}>
@@ -15196,6 +15752,66 @@ You must design a visual composition that tells the story through **8 distinct p
                                                                         {activeDropdown?.nodeId === node.id && activeDropdown.type === 'rhres' && (<div className={dropCls3} onMouseDown={e => e.stopPropagation()}>
                                                                             {['480p','720p','1080p','2k','4k'].map(r => (<button key={r} onClick={() => { updateNodeSettings(node.id, { rhResolution: r }); setActiveDropdown(null); }} className={itemCls3}>{r}</button>))}
                                                                         </div>)}
+                                                                            </>);
+                                                                        })()}
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })()}
+
+                                                    {/* ★ Seedance 视频参数（仅 gen-video + Seedance 模型） */}
+                                                    {node.type === 'gen-video' && (() => {
+                                                        const currentModel = apiConfigsMap.get(node.settings?.model);
+                                                        const isSeedance = currentModel?.isSeedance === true;
+                                                        if (!isSeedance) return null;
+
+                                                        const SEEDANCE_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9', '9:21', '3:2', '2:3'];
+                                                        const SEEDANCE_DURATIONS = [3, 5, 8, 10, 11];
+
+                                                        return (
+                                                            <div className={`mt-2 pt-2 border-t space-y-2 ${theme === 'dark' ? 'border-orange-700/30' : 'border-orange-200'}`}>
+                                                                <div className={`text-[10px] font-semibold ${theme === 'dark' ? 'text-orange-300' : 'text-orange-600'}`}>🔥 Seedance 参数</div>
+                                                                <div className="flex gap-1 flex-wrap">
+                                                                    {/* Duration dropdown */}
+                                                                    <div className="relative">
+                                                                        {(() => {
+                                                                            const isDark = theme === 'dark';
+                                                                            const btnCls = 'flex items-center gap-1 px-1.5 py-1 rounded text-[9px] border ' + (isDark ? 'bg-zinc-800/50 hover:bg-zinc-800 text-orange-400 border-zinc-700/50' : 'bg-orange-50 hover:bg-orange-100 text-orange-600 border-orange-200');
+                                                                            const dropCls = 'absolute bottom-full left-0 mb-1 w-14 rounded-lg shadow-xl p-1 z-[60] border ' + (isDark ? 'bg-[#18181b] border-zinc-700' : 'bg-white border-zinc-200');
+                                                                            const itemCls = isDark ? 'w-full text-center py-1 text-[10px] rounded text-zinc-300 hover:bg-zinc-800' : 'w-full text-center py-1 text-[10px] rounded text-zinc-700 hover:bg-zinc-100';
+                                                                            return (<>
+                                                                                <button onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'seedur' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'seedur' }); }} className={btnCls}>
+                                                                                    {(node.settings?.seedanceDuration || 5)}s
+                                                                                </button>
+                                                                                {activeDropdown?.nodeId === node.id && activeDropdown.type === 'seedur' && (
+                                                                                    <div className={dropCls} onMouseDown={e => e.stopPropagation()}>
+                                                                                        {SEEDANCE_DURATIONS.map(d => (
+                                                                                            <button key={d} onClick={() => { updateNodeSettings(node.id, { seedanceDuration: d }); setActiveDropdown(null); }} className={itemCls}>{d}s</button>
+                                                                                        ))}
+                                                                                    </div>
+                                                                                )}
+                                                                            </>);
+                                                                        })()}
+                                                                    </div>
+                                                                    {/* Ratio dropdown */}
+                                                                    <div className="relative">
+                                                                        {(() => {
+                                                                            const isDark = theme === 'dark';
+                                                                            const btnCls2 = 'flex items-center gap-1 px-1.5 py-1 rounded text-[9px] border ' + (isDark ? 'bg-zinc-800/50 hover:bg-zinc-800 text-orange-400 border-zinc-700/50' : 'bg-orange-50 hover:bg-orange-100 text-orange-600 border-orange-200');
+                                                                            const dropCls2 = 'absolute bottom-full left-0 mb-1 w-20 rounded-lg shadow-xl p-1 z-[60] border ' + (isDark ? 'bg-[#18181b] border-zinc-700' : 'bg-white border-zinc-200');
+                                                                            const itemCls2 = isDark ? 'w-full text-center py-1 text-[10px] rounded text-zinc-300 hover:bg-zinc-800' : 'w-full text-center py-1 text-[10px] rounded text-zinc-700 hover:bg-zinc-100';
+                                                                            return (<>
+                                                                                <button onClick={e => { e.stopPropagation(); setActiveDropdown(activeDropdown?.type === 'seeratio' && activeDropdown.nodeId === node.id ? null : { nodeId: node.id, type: 'seeratio' }); }} className={btnCls2}>
+                                                                                    {node.settings?.seedanceRatio || '16:9'}
+                                                                                </button>
+                                                                                {activeDropdown?.nodeId === node.id && activeDropdown.type === 'seeratio' && (
+                                                                                    <div className={dropCls2} onMouseDown={e => e.stopPropagation()}>
+                                                                                        {SEEDANCE_RATIOS.map(r => (
+                                                                                            <button key={r} onClick={() => { updateNodeSettings(node.id, { seedanceRatio: r }); setActiveDropdown(null); }} className={itemCls2}>{r}</button>
+                                                                                        ))}
+                                                                                    </div>
+                                                                                )}
                                                                             </>);
                                                                         })()}
                                                                     </div>
@@ -16824,7 +17440,8 @@ You must design a visual composition that tells the story through **8 distinct p
                                                             </div>
                                                         </>
                                                     ) : api.isRunningHub ? (
-                                                        /* RunningHub 工作流特殊渲染 */
+                                                        /* RunningHub 配置：只在 runninghub-image 卡片显示完整配置，其他两个显示共享提示 */
+                                                        api.id === 'runninghub-image' ? (
                                                         <>
                                                             <div className="grid grid-cols-4 items-center gap-2">
                                                                 <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
@@ -16874,15 +17491,55 @@ You must design a visual composition that tells the story through **8 distinct p
                                                                     placeholder="回调地址（可选）..."
                                                                 />
                                                             </div>
+                                                            {/* ★ RunningHub 模型 API 模型选择 */}
+                                                            <div className="col-span-4 flex items-center gap-2 mt-1">
+                                                                <label className={`text-[9px] font-medium shrink-0 ${theme === 'dark' ? 'text-green-400/80' : 'text-green-500/80'}`}>
+                                                                    模型ID
+                                                                </label>
+                                                                <select
+                                                                    value={runninghubModelId}
+                                                                    onChange={(e) => setRunninghubModelId(e.target.value)}
+                                                                    className={`flex-1 rounded px-2 py-1 text-xs outline-none focus:border-green-500/50 border ${
+                                                                        theme === 'dark'
+                                                                            ? 'bg-zinc-900 border-zinc-800 text-zinc-300'
+                                                                            : 'bg-white border-zinc-300 text-zinc-900'
+                                                                    }`}
+                                                                >
+                                                                    <optgroup label="Seedream 系列（图生图）">
+                                                                        <option value="seedream-v4">Seedream v4</option>
+                                                                        <option value="seedream-v4.5">Seedream v4.5</option>
+                                                                        <option value="seedream-v5-lite">Seedream v5 Lite</option>
+                                                                    </optgroup>
+                                                                    <optgroup label="RHArt 系列（文生图）">
+                                                                        <option value="rhart-image-v1">RHArt Image v1</option>
+                                                                        <option value="rhart-image-n-pro">RHArt Image N Pro</option>
+                                                                    </optgroup>
+                                                                    <optgroup label="RHArt 系列（图生图）">
+                                                                        <option value="rhart-image-n-g31-flash">RHArt Image N G31 Flash</option>
+                                                                    </optgroup>
+                                                                    <optgroup label="Nano Banana 系列">
+                                                                        <option value="nano-banana">Nano Banana</option>
+                                                                        <option value="nano-banana-2">Nano Banana 2</option>
+                                                                        <option value="nano-banana-pro">Nano Banana Pro</option>
+                                                                    </optgroup>
+                                                                </select>
+                                                            </div>
                                                             <div className="col-span-4 mt-2">
                                                                 <p className={`text-[9px] ${theme === 'dark' ? 'text-green-400/70' : 'text-green-500/80'}`}>
-                                                                    🤖 RunningHub ComfyUI 工作流 · 支持图片/视频生成
+                                                                    🤖 RunningHub ComfyUI 工作流 + 模型 API · 支持图片/视频生成
                                                                 </p>
                                                                 <p className={`text-[9px] mt-1 ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>
                                                                     📌 如何使用：<a href="https://www.runninghub.cn/runninghub-api-doc-cn/doc-8287342" target="_blank" className="underline hover:text-blue-400">查看接口文档</a>
+                                                                    {' · '}<a href="https://www.runninghub.cn/openapi" target="_blank" className="underline hover:text-blue-400">模型 API 文档</a>
                                                                 </p>
                                                             </div>
                                                         </>
+                                                        ) : (
+                                                        /* runninghub-video / runninghub-model：不重复渲染配置，显示共享提示 */
+                                                        <div className={`text-[9px] py-1 ${theme === 'dark' ? 'text-green-400/60' : 'text-green-500/70'}`}>
+                                                            🔗 配置已共享至上方「RunningHub 绘图工作流」卡片，无需重复填写
+                                                        </div>
+                                                        )
                                                     ) : (
                                                     /* 其他模型：标准三行输入 */
                                                     [
